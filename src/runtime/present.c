@@ -14,7 +14,7 @@
  *   F11, Alt+Enter   borderless fullscreen on the window's monitor
  *   F12              scaling: sharp-bilinear (default), smooth, CRT, nearest, integer
  *   F10, right-click on the bars   the settings menu (scaling, bars,
- *                    fullscreen, the game's resolution); kept in ra2.ini
+ *                    fullscreen, the game's resolution, battle info); kept in ra2.ini
  */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "battleinfo.h"
 #include "input.h"
 #include "present.h"
 #include "hdvox.h"
@@ -832,6 +833,9 @@ static void settings_save(HWND hw) {
         _snprintf(hv, sizeof hv - 1, "%ld", g_ui_scale), hv[sizeof hv - 1] = 0;
         WritePrivateProfileStringA("present", "uiscale", hv, g_ini);    /* 1, 2 or 3 */
     }
+    WritePrivateProfileStringA("present", "healthbars", battleinfo_bars_name(ra2_healthbars), g_ini);
+    WritePrivateProfileStringA("present", "buildinfo", ra2_buildinfo ? "1" : "0", g_ini);
+    WritePrivateProfileStringA("present", "overlay", ra2_overlay ? "1" : "0", g_ini);
     if (hw && !g_fullscreen && !IsIconic(hw)) {
         RECT r;
         GetWindowRect(hw, &r);
@@ -893,7 +897,7 @@ static int zoom_size(HWND hw, int z2, int* w, int* h) {
 
 enum { ID_SCALE = 100, ID_BARS = 200, ID_FULL = 300, ID_RES = 400, ID_HDVOX = 500,
        ID_MOD = 600, ID_CONTROLS = 700, ID_CURSOR_LOCK = 710, ID_UI = 800, ID_KEYS = 900, ID_KEYS_RESET = 990,
-       ID_ZOOM = 1000 };
+       ID_ZOOM = 1000, ID_BARS_MODE = 1100, ID_BUILDINFO = 1110, ID_OVERLAY = 1111 };
 #define MAX_MENU_MODS 64
 
 /* ---- the keybinding page (F10 > Keys) --------------------------------------
@@ -1007,6 +1011,7 @@ static void settings_menu(HWND hw) {             /* at the mouse */
     HMENU ui = CreatePopupMenu();
     HMENU zoom = CreatePopupMenu();
     HMENU keys = CreatePopupMenu();
+    HMENU info = CreatePopupMenu(), bars_mode = CreatePopupMenu();
     static char mod_names[MAX_MENU_MODS][128];
     int nmods = mods_list(mod_names, MAX_MENU_MODS);
     static const char* const scale_label[NMODES] = { "Sharp (default)", "Smooth", "CRT", "Nearest", "Integer" };
@@ -1050,6 +1055,15 @@ static void settings_menu(HWND hw) {             /* at the mouse */
     AppendMenuA(ui, MF_STRING | (g_ui_scale == 2 ? MF_CHECKED : 0), ID_UI + 2, "2x (game resolution 1200 lines or more)");
     AppendMenuA(ui, MF_STRING | (g_ui_scale == 3 ? MF_CHECKED : 0), ID_UI + 3, "3x (1800 lines or more)");
     AppendMenuA(m, MF_POPUP, (UINT_PTR)ui, "UI scale, the sidebar (next battle)");
+    {   /* battleinfo.c */
+        static const char* const bars_label[3] = { "When selected (original)", "When damaged", "Always" };
+        for (int i = 0; i < 3; i++)
+            AppendMenuA(bars_mode, MF_STRING | (ra2_healthbars == i ? MF_CHECKED : 0), ID_BARS_MODE + i, bars_label[i]);
+        AppendMenuA(info, MF_POPUP, (UINT_PTR)bars_mode, "Health bars");
+        AppendMenuA(info, MF_STRING | (ra2_buildinfo ? MF_CHECKED : 0), ID_BUILDINFO, "Build % and build time on the sidebar");
+        AppendMenuA(info, MF_STRING | (ra2_overlay ? MF_CHECKED : 0), ID_OVERLAY, "Clock, FPS and APM line");
+        AppendMenuA(m, MF_POPUP, (UINT_PTR)info, "Battle info");
+    }
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     for (int i = 0; i < NZOOM; i++) {
         int zw, zh, ok = zoom_size(hw, k_zoom2[i], &zw, &zh);
@@ -1106,6 +1120,9 @@ static void settings_menu(HWND hw) {             /* at the mouse */
     else if (cmd >= ID_RES && cmd < ID_RES + NRES)       /* the size on screen, with the UI scale's sidebar */
         set_game_resolution(ui_game_w(k_res[cmd - ID_RES][0], k_res[cmd - ID_RES][1]), k_res[cmd - ID_RES][1]);
     else if (cmd == ID_CURSOR_LOCK) g_cursor_lock = !cursor_lock_on();
+    else if (cmd >= ID_BARS_MODE && cmd < ID_BARS_MODE + 3) ra2_healthbars = cmd - ID_BARS_MODE;
+    else if (cmd == ID_BUILDINFO) ra2_buildinfo = !ra2_buildinfo;
+    else if (cmd == ID_OVERLAY) ra2_overlay = !ra2_overlay;
     else if (cmd >= ID_MOD && cmd <= ID_MOD + nmods) {
         const char* name = cmd == ID_MOD ? "" : mod_names[cmd - ID_MOD - 1];
         char ask[256];
@@ -1286,6 +1303,49 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT m, WPARAM w, LPARAM l) {
     return hw ? DefWindowProcA(hw, m, w, l) : 0;     /* no window: the self-test */
 }
 
+/* The battle info line (battleinfo.c): "12:34  60 FPS  85 APM" at the top of
+ * the battlefield, drawn into the game's picture before it is scaled, so it
+ * scales with it. A 3x5 font of the few characters it needs, at a whole
+ * multiple of one game pixel per 480 lines, white on a darkened box. */
+static const struct { char c; uint16_t rows; } k_font[] = {   /* 5 rows of 3 bits, top first */
+    { '0', 075557 }, { '1', 026227 }, { '2', 071747 }, { '3', 071717 }, { '4', 055711 },
+    { '5', 074717 }, { '6', 074757 }, { '7', 071111 }, { '8', 075757 }, { '9', 075717 },
+    { ':', 002020 }, { 'F', 074744 }, { 'P', 075744 }, { 'S', 074717 }, { 'A', 025755 },
+    { 'M', 057555 }, { ' ', 0 },
+};
+
+static uint16_t glyph(char c) {
+    for (size_t i = 0; i < sizeof k_font / sizeof k_font[0]; i++)
+        if (k_font[i].c == c) return k_font[i].rows;
+    return 0;
+}
+
+static void draw_overlay(uint32_t* f, int w, int h) {
+    const char* text = ra2_overlay ? battleinfo_overlay_text() : "";
+    int n = (int)strlen(text), k = h / 480 > 1 ? h / 480 : 1;
+    if (!n) return;
+    int tw = n * 4 * k + 3 * k, th = 7 * k;
+    int x0 = (w - SIDEBAR_W - tw) / 2, y0 = 2 * k;
+    if (x0 < 0) x0 = 0;
+    for (int y = y0; y < y0 + th && y < h; y++)              /* the box: the picture at a quarter */
+        for (int x = x0; x < x0 + tw && x < w; x++) {
+            uint32_t p = f[(size_t)y * w + x];
+            f[(size_t)y * w + x] = (p >> 2) & 0x3F3F3F;
+        }
+    for (int i = 0; i < n; i++) {
+        uint16_t g = glyph(text[i]);
+        for (int r = 0; r < 5; r++)
+            for (int c = 0; c < 3; c++) {
+                if (!(g >> ((4 - r) * 3 + (2 - c)) & 1)) continue;
+                for (int dy = 0; dy < k; dy++)
+                    for (int dx = 0; dx < k; dx++) {
+                        int x = x0 + 2 * k + (i * 4 + c) * k + dx, y = y0 + k + r * k + dy;
+                        if (x < w && y < h) f[(size_t)y * w + x] = 0xFFFFFF;
+                    }
+            }
+    }
+}
+
 /* RA2_FRAME_STATS=1: every 2 s, how many pictures the presenter showed, what
  * the copy out of the primary and the draw (upload, shader, Present) took,
  * and how many frames the game itself ran, so a slow picture says whether
@@ -1403,6 +1463,10 @@ static DWORD WINAPI present_thread(LPVOID arg) {
             if ((n == seen && since < 33) || since < 16) { Sleep(1); continue; }
             seen = n, last = timeGetTime();
         }
+        {
+            static DWORD ticked;                   /* the overlay's numbers, once a second */
+            if (timeGetTime() - ticked >= 1000) ticked = timeGetTime(), battleinfo_tick();
+        }
         LARGE_INTEGER t0, t1, t2;
         QueryPerformanceCounter(&t0);
         int dx, dy, dw, dh;
@@ -1413,6 +1477,7 @@ static DWORD WINAPI present_thread(LPVOID arg) {
             int full = gw;
             const uint32_t* pic;
             gw = cut_menu_band(frame, gw, gh, 1);  /* the base is 1x now */
+            if (gw == full) draw_overlay(frame, gw, gh);
             gw = ui_compose(frame, gw, gh, &pic);
             InterlockedExchange(&g_gw, gw);
             InterlockedExchange(&g_gh, gh);
@@ -1427,7 +1492,9 @@ static DWORD WINAPI present_thread(LPVOID arg) {
             frame_stats(t0, t1, t2);
         } else if (host_frame(frame, 4096, 2160, &gw, &gh)) {
             const uint32_t* pic;
+            int full = gw;
             gw = cut_menu_band(frame, gw, gh, 1);
+            if (gw == full) draw_overlay(frame, gw, gh);
             gw = ui_compose(frame, gw, gh, &pic);
             InterlockedExchange(&g_gw, gw);
             InterlockedExchange(&g_gh, gh);
@@ -1562,6 +1629,12 @@ void present_start(int mode, int fullscreen) {
     GetPrivateProfileStringA("present", "cursorlock", "auto", v, sizeof v, g_ini);
     g_cursor_lock = !_stricmp(v, "on") || !strcmp(v, "1") ? 1 : !_stricmp(v, "off") || !strcmp(v, "0") ? 0 : -1;
     input_keys_load(g_ini);
+    if (!battleinfo_cmdline()) {            /* --healthbars, --buildinfo or --overlay win */
+        GetPrivateProfileStringA("present", "healthbars", "selected", v, sizeof v, g_ini);
+        ra2_healthbars = battleinfo_bars_from_name(v) >= 0 ? battleinfo_bars_from_name(v) : 0;
+        ra2_buildinfo = GetPrivateProfileIntA("present", "buildinfo", 0, g_ini) != 0;
+        ra2_overlay = GetPrivateProfileIntA("present", "overlay", 0, g_ini) != 0;
+    }
     if (fullscreen < 0) fullscreen = GetPrivateProfileIntA("present", "fullscreen", 0, g_ini);
     if (!ra2_vox_hd_on) {                   /* --hd-voxels forces it; the ini holds 0 off, 2/3 scale */
         int hv = GetPrivateProfileIntA("present", hdvox_key(), host_under_wine() ? 0 : 2, g_ini);
