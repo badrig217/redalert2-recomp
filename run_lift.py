@@ -563,6 +563,50 @@ def clip_line_patches(target):
             accept: reset, reject: reset}
 
 
+# BSurface pixel read (host.c ra2_bsurf_getpixel). The voxel plotter reads two
+# pixels per sample through Surface slot 10, six virtual calls each; at 1440p
+# that chain was about a third of the game thread's time (profile logs). After
+# the function's first instruction (eax = POINT*, ecx = this) the host answers
+# when the surface is a plain BSurface and the function returns as its own
+# `ret 4` would (eax = the pixel). Get_Pixel is 0x007BAE60 in gamemd.exe and
+# 0x007741D0 in game.exe, the same instructions in both; host.c picks the
+# matching vtable addresses by RA2_TARGET_GAME.
+BSURFACE_GETPIXEL_SITES = {'gamemd': 0x007BAE60, 'game': 0x007741D0}
+
+
+def bsurface_fast_patches(target):
+    return {BSURFACE_GETPIXEL_SITES[target]:
+            ('{ extern int ra2_bsurf_getpixel(uint32_t, uint32_t, uint32_t*); uint32_t _px; '
+             'if (ra2_bsurf_getpixel(ecx, eax, &_px)) { eax = _px; RECOMP_FLAGS_OUT(); esp += 8; '
+             '{ RECOMP_REGS_OUT(); return; } } } '
+             '/* remaster: BSurface pixel read, run_lift.py bsurface_fast_patches */')}
+
+
+# Cheat hotkeys (docs/cheats.md, src/runtime/cheats.c). 'event' executes one
+# event from the game's event ring (EventClass, ecx = the event; plain ret);
+# its first instruction is `sub esp, 0x370`. After it the host looks at the
+# event: a cheat event (type 3 with a tag of its own) is carried out here and
+# the function returns as its own `ret` would; a campaign victory calls 'win'
+# (HouseClass::Win(bool), ret 4) for the house that sent it, as the game's own
+# code does with `push 0`. Every other event runs the game's code unchanged.
+# Built into every host, so every build in a LAN game understands the event.
+CHEAT_TARGETS = {
+    'gamemd': {'event': 0x004C6CB0, 'win': 'sub_004FC9E0'},
+    'game': {'event': 0x004B65C0, 'win': 'sub_004E7EE0'},
+}
+
+
+def cheat_patches(target):
+    t = CHEAT_TARGETS[target]
+    return {t['event']: (
+        '{ extern int ra2_cheat_event(uint32_t, uint32_t*); uint32_t _ch_w = 0; '
+        'int _ch = ra2_cheat_event(ecx, &_ch_w); '
+        'if (_ch) { esp += 0x370u; '
+        'if (_ch == 2) { PUSH32(esp, 0u); ecx = _ch_w; RECOMP_CALL(%s); } '
+        'RECOMP_FLAGS_OUT(); esp += 4; { RECOMP_REGS_OUT(); return; } } } '
+        '/* cheat hotkeys: the cheat event (run_lift.py CHEAT_TARGETS) */') % t['win']}
+
+
 # The launcher check. gamemd.exe starts by looking for RA2MD.exe (0x0049F5C0,
 # "COPYPROTECTION - Checking if launcher is running": a named mutex the launcher
 # holds) and later signals it (0x0049F620, "Notify launcher": an event, a window
@@ -763,7 +807,9 @@ def targets():
                                                  **clip_line_patches('gamemd'), **launcher_patches('gamemd'),
                                                  **view_clamp_patches('gamemd'),
                                                  **ui_scale_patches('gamemd'),
-                                                 **battle_info_patches('gamemd', code, cs)}),
+                                                 **battle_info_patches('gamemd', code, cs),
+                                                 **bsurface_fast_patches('gamemd'),
+                                                 **cheat_patches('gamemd')}),
         'game': dict(exe=os.path.join(_HERE, 'game', 'game.exe'),
                      catalog=os.path.join(_HERE, 'work', 'game', 'functions.json'),
                      seeds=os.path.join(_HERE, 'work', 'game', 'rtti_seeds.json'),
@@ -781,7 +827,9 @@ def targets():
                                                **clip_line_patches('game'), **launcher_patches('game'),
                                                **view_clamp_patches('game'),
                                                **ui_scale_patches('game'),
-                                               **battle_info_patches('game', code, cs)}),
+                                               **battle_info_patches('game', code, cs),
+                                               **bsurface_fast_patches('game'),
+                                               **cheat_patches('game')}),
     }
 
 

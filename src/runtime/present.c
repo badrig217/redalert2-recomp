@@ -35,6 +35,7 @@
 #include "hdvox.h"
 #include "mods.h"
 #include "recomp_target.h"
+#include "cheats.h"
 
 int host_frame(uint32_t* out, int maxw, int maxh, int* w, int* h);   /* host.c */
 int host_frame_hd(uint32_t* out, int maxw, int maxh, int* w, int* h);   /* host.c: 2x, HD voxels */
@@ -123,6 +124,7 @@ static int g_mode;                       /* index into k_mode_names */
 static int g_bars = 1;                   /* the bars beside a letterboxed picture: 0 black, 1 blurred */
 /* Modern controls (docs/modern-controls.md). The window procedure
  * latches what the game's hooks need from the real mouse messages: */
+static int g_cheats;                       /* cheat hotkeys on (docs/cheats.md), ra2.ini cheats=, on by default */
 static volatile LONG g_modern_controls;  /* opt-in battlefield semantics */
 static volatile LONG g_modern_left_double_click_at;    /* tick of a battlefield double-click */
 static volatile LONG g_modern_left_double_click_shift; /* ... made with Shift held */
@@ -836,6 +838,7 @@ static void settings_save(HWND hw) {
     WritePrivateProfileStringA("present", "healthbars", battleinfo_bars_name(ra2_healthbars), g_ini);
     WritePrivateProfileStringA("present", "buildinfo", ra2_buildinfo ? "1" : "0", g_ini);
     WritePrivateProfileStringA("present", "overlay", ra2_overlay ? "1" : "0", g_ini);
+    WritePrivateProfileStringA("present", "cheats", g_cheats ? "1" : "0", g_ini);
     if (hw && !g_fullscreen && !IsIconic(hw)) {
         RECT r;
         GetWindowRect(hw, &r);
@@ -897,7 +900,8 @@ static int zoom_size(HWND hw, int z2, int* w, int* h) {
 
 enum { ID_SCALE = 100, ID_BARS = 200, ID_FULL = 300, ID_RES = 400, ID_HDVOX = 500,
        ID_MOD = 600, ID_CONTROLS = 700, ID_CURSOR_LOCK = 710, ID_UI = 800, ID_KEYS = 900, ID_KEYS_RESET = 990,
-       ID_ZOOM = 1000, ID_BARS_MODE = 1100, ID_BUILDINFO = 1110, ID_OVERLAY = 1111 };
+       ID_ZOOM = 1000, ID_BARS_MODE = 1100, ID_BUILDINFO = 1110, ID_OVERLAY = 1111,
+       ID_CHEATS = 1200 };
 #define MAX_MENU_MODS 64
 
 /* ---- the keybinding page (F10 > Keys) --------------------------------------
@@ -1064,6 +1068,10 @@ static void settings_menu(HWND hw) {             /* at the mouse */
         AppendMenuA(info, MF_STRING | (ra2_overlay ? MF_CHECKED : 0), ID_OVERLAY, "Clock, FPS and APM line");
         AppendMenuA(m, MF_POPUP, (UINT_PTR)info, "Battle info");
     }
+    {   /* cheats.c, docs/cheats.md */
+        AppendMenuA(m, MF_STRING | (g_cheats ? MF_CHECKED : 0), ID_CHEATS,
+                    "Cheats (Ctrl+Shift+M money, Ctrl+Shift+W win the mission)");
+    }
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     for (int i = 0; i < NZOOM; i++) {
         int zw, zh, ok = zoom_size(hw, k_zoom2[i], &zw, &zh);
@@ -1123,6 +1131,7 @@ static void settings_menu(HWND hw) {             /* at the mouse */
     else if (cmd >= ID_BARS_MODE && cmd < ID_BARS_MODE + 3) ra2_healthbars = cmd - ID_BARS_MODE;
     else if (cmd == ID_BUILDINFO) ra2_buildinfo = !ra2_buildinfo;
     else if (cmd == ID_OVERLAY) ra2_overlay = !ra2_overlay;
+    else if (cmd == ID_CHEATS) g_cheats = !g_cheats;
     else if (cmd >= ID_MOD && cmd <= ID_MOD + nmods) {
         const char* name = cmd == ID_MOD ? "" : mod_names[cmd - ID_MOD - 1];
         char ask[256];
@@ -1184,6 +1193,16 @@ static int presenter_key_bound(int vk) {
     return input_key_is(KEY_SETTINGS, vk) || input_key_is(KEY_FULLSCREEN, vk) || input_key_is(KEY_SCALING, vk);
 }
 
+
+/* Cheat hotkeys (docs/cheats.md): Ctrl+Shift+M money, Ctrl+Shift+W win the
+ * campaign mission, when F10's Cheats is on. Not with Alt, and not again
+ * while the key is held. The game thread queues the event (host.c). */
+static int cheat_key(int vk, int repeat) {
+    if (!g_cheats || (vk != 'M' && vk != 'W') || !(GetKeyState(VK_CONTROL) & 0x8000) ||
+        !(GetKeyState(VK_SHIFT) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return 0;
+    if (!repeat) host_cheat_post(vk == 'W' ? 2 : 1);
+    return 1;
+}
 static LRESULT CALLBACK wndproc(HWND hw, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -1267,6 +1286,7 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT m, WPARAM w, LPARAM l) {
         forward_key(m, w, l);
         return 0;
     case WM_KEYDOWN:
+        if (cheat_key((int)w, (l & 0x40000000) != 0)) return 0;
         if (ra2_modern_key((int)w, (l & 0x40000000) != 0)) return 0;
         if (presenter_key(hw, (int)w)) return 0;
         forward_key(m, w, l);
@@ -1629,6 +1649,7 @@ void present_start(int mode, int fullscreen) {
     GetPrivateProfileStringA("present", "cursorlock", "auto", v, sizeof v, g_ini);
     g_cursor_lock = !_stricmp(v, "on") || !strcmp(v, "1") ? 1 : !_stricmp(v, "off") || !strcmp(v, "0") ? 0 : -1;
     input_keys_load(g_ini);
+    g_cheats = GetPrivateProfileIntA("present", "cheats", 1, g_ini) != 0;
     if (!battleinfo_cmdline()) {            /* --healthbars, --buildinfo or --overlay win */
         GetPrivateProfileStringA("present", "healthbars", "selected", v, sizeof v, g_ini);
         ra2_healthbars = battleinfo_bars_from_name(v) >= 0 ? battleinfo_bars_from_name(v) : 0;
