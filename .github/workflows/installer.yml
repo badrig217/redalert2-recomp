@@ -35,8 +35,13 @@ jobs:
 
   build:
     needs: plan
+    # one platform failing leaves the others running; macOS may fail outright
+    # (GitHub sometimes finds no macOS runner for the job), and a release
+    # goes out without it
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    continue-on-error: ${{ matrix.platform == 'macos' }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -106,7 +111,9 @@ jobs:
           path: out/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # also when the macOS build failed or never found a runner: the release
+    # takes the installers that were built, as long as Windows and Linux are
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -116,6 +123,12 @@ jobs:
         with:
           path: out
           merge-multiple: true
+      - run: |
+          ls -l out
+          for f in RA2-Recomp-Installer-windows-x64.exe RA2-Recomp-Installer-linux-x64.tar.gz; do
+            [ -f "out/$f" ] || { echo "::error::$f was not built: no release"; exit 1; }
+          done
+          [ -f out/RA2-Recomp-Installer-macos-arm64.zip ] || echo "::warning::no macOS installer in this release"
       - env:
           GH_TOKEN: ${{ github.token }}
         # a tag with a hyphen (v0.1.0-alpha.1) is a pre-release
