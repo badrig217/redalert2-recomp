@@ -124,7 +124,7 @@ static int g_mode;                       /* index into k_mode_names */
 static int g_bars = 1;                   /* the bars beside a letterboxed picture: 0 black, 1 blurred */
 /* Modern controls (docs/modern-controls.md). The window procedure
  * latches what the game's hooks need from the real mouse messages: */
-static int g_cheats;                       /* cheat hotkeys on (docs/cheats.md), ra2.ini cheats= */
+static int g_cheats;                       /* cheat hotkeys on (docs/cheats.md), ra2.ini cheats=, on by default */
 static volatile LONG g_modern_controls;  /* opt-in battlefield semantics */
 static volatile LONG g_modern_left_double_click_at;    /* tick of a battlefield double-click */
 static volatile LONG g_modern_left_double_click_shift; /* ... made with Shift held */
@@ -1649,7 +1649,7 @@ void present_start(int mode, int fullscreen) {
     GetPrivateProfileStringA("present", "cursorlock", "auto", v, sizeof v, g_ini);
     g_cursor_lock = !_stricmp(v, "on") || !strcmp(v, "1") ? 1 : !_stricmp(v, "off") || !strcmp(v, "0") ? 0 : -1;
     input_keys_load(g_ini);
-    g_cheats = GetPrivateProfileIntA("present", "cheats", 0, g_ini) != 0;
+    g_cheats = GetPrivateProfileIntA("present", "cheats", 1, g_ini) != 0;
     if (!battleinfo_cmdline()) {            /* --healthbars, --buildinfo or --overlay win */
         GetPrivateProfileStringA("present", "healthbars", "selected", v, sizeof v, g_ini);
         ra2_healthbars = battleinfo_bars_from_name(v) >= 0 ? battleinfo_bars_from_name(v) : 0;

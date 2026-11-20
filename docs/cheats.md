@@ -1,6 +1,6 @@
 # Cheat hotkeys
 
-Off by default. F10, **Cheats**, turns them on (`cheats=1` under `[present]`
+On by default. F10, **Cheats**, turns them off (`cheats=0` under `[present]`
 in `ra2.ini`). Windows only for the keys. Every host carries the cheats out
 (see LAN below).
 

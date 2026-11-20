@@ -98,7 +98,7 @@ A `--scale` or `--fullscreen` on the command line wins over the file.
   window is on, also when windowed. The menu writes the same
   `[Video] ScreenWidth`/`ScreenHeight` and options as *Game resolution*.
 - **Cheats** (`cheats=0|1`): Ctrl+Shift+M for money, Ctrl+Shift+W to win a
-  campaign mission, off by default ([cheats.md](cheats.md)).
+  campaign mission, on by default ([cheats.md](cheats.md)).
 - While the menu is open the picture holds still (the menu runs its own
   message loop on the presenter's thread); the game itself keeps running.
 
