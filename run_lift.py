@@ -563,6 +563,25 @@ def clip_line_patches(target):
             accept: reset, reject: reset}
 
 
+# BSurface pixel read (host.c ra2_bsurf_getpixel). The voxel plotter reads two
+# pixels per sample through Surface slot 10, six virtual calls each; at 1440p
+# that chain was about a third of the game thread's time (profile logs). After
+# the function's first instruction (eax = POINT*, ecx = this) the host answers
+# when the surface is a plain BSurface and the function returns as its own
+# `ret 4` would (eax = the pixel). Get_Pixel is 0x007BAE60 in gamemd.exe and
+# 0x007741D0 in game.exe, the same instructions in both; host.c picks the
+# matching vtable addresses by RA2_TARGET_GAME.
+BSURFACE_GETPIXEL_SITES = {'gamemd': 0x007BAE60, 'game': 0x007741D0}
+
+
+def bsurface_fast_patches(target):
+    return {BSURFACE_GETPIXEL_SITES[target]:
+            ('{ extern int ra2_bsurf_getpixel(uint32_t, uint32_t, uint32_t*); uint32_t _px; '
+             'if (ra2_bsurf_getpixel(ecx, eax, &_px)) { eax = _px; RECOMP_FLAGS_OUT(); esp += 8; '
+             '{ RECOMP_REGS_OUT(); return; } } } '
+             '/* remaster: BSurface pixel read, run_lift.py bsurface_fast_patches */')}
+
+
 # The launcher check. gamemd.exe starts by looking for RA2MD.exe (0x0049F5C0,
 # "COPYPROTECTION - Checking if launcher is running": a named mutex the launcher
 # holds) and later signals it (0x0049F620, "Notify launcher": an event, a window
@@ -763,7 +782,8 @@ def targets():
                                                  **clip_line_patches('gamemd'), **launcher_patches('gamemd'),
                                                  **view_clamp_patches('gamemd'),
                                                  **ui_scale_patches('gamemd'),
-                                                 **battle_info_patches('gamemd', code, cs)}),
+                                                 **battle_info_patches('gamemd', code, cs),
+                                                 **bsurface_fast_patches('gamemd')}),
         'game': dict(exe=os.path.join(_HERE, 'game', 'game.exe'),
                      catalog=os.path.join(_HERE, 'work', 'game', 'functions.json'),
                      seeds=os.path.join(_HERE, 'work', 'game', 'rtti_seeds.json'),
@@ -781,7 +801,8 @@ def targets():
                                                **clip_line_patches('game'), **launcher_patches('game'),
                                                **view_clamp_patches('game'),
                                                **ui_scale_patches('game'),
-                                               **battle_info_patches('game', code, cs)}),
+                                               **battle_info_patches('game', code, cs),
+                                               **bsurface_fast_patches('game')}),
     }
 
 
