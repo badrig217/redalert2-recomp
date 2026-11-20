@@ -1,6 +1,11 @@
 # The installer for this commit, for Windows, Linux and macOS (recomp-launcher
 # with launcher/launcher.json): artifacts on every push to main, release
 # files on a v* tag.
+#
+# A copy of sp00nznet/recomp-launcher's reusable installer workflow (called
+# with name RA2-Recomp-Installer), kept here so its actions can run on Node 24
+# (checkout v5, setup-go v6, upload-artifact v6, download-artifact v7) without
+# waiting for that repository. The launcher's code is still recomp-launcher@main.
 name: installer
 
 on:
@@ -13,7 +18,109 @@ permissions:
   contents: write
 
 jobs:
-  installer:
-    uses: sp00nznet/recomp-launcher/.github/workflows/installer.yml@main
-    with:
-      name: RA2-Recomp-Installer
+  # the build matrix, cut down to the platforms the game's setup supports
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          PLATFORMS: windows linux macos
+        run: |
+          all='[{"platform":"windows","os":"windows-2022","file":"windows-x64.exe","ldflags":"-H=windowsgui"},
+                {"platform":"linux","os":"ubuntu-24.04","file":"linux-x64"},
+                {"platform":"macos","os":"macos-15","file":"macos-arm64"}]'
+          echo "matrix=$(jq -c --arg p "$PLATFORMS" '{include: [.[] | select(.platform as $x | $p | split(" ") | index($x))]}' <<<"$all")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      OUT: RA2-Recomp-Installer-${{ matrix.file }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: sp00nznet/recomp-launcher
+          ref: main
+      - uses: actions/checkout@v5
+        with:
+          path: _game
+          sparse-checkout: launcher
+      - run: rm -rf game && cp -r "_game/launcher" game
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev libgl1-mesa-dev xorg-dev
+      # Version info and a manifest in the exe. An unsigned exe with neither,
+      # that downloads code and runs PowerShell, is what antivirus heuristics
+      # flag (issue themepark-recomp#33); these make it look like what it is.
+      - if: runner.os == 'Windows'
+        run: |
+          go install github.com/tc-hib/go-winres@v0.3.3
+          title=$(jq -r .title game/launcher.json)
+          ver=0.0.0.0
+          case "$GITHUB_REF" in refs/tags/v*) v=${GITHUB_REF_NAME#v}; v=${v%%-*}; ver="$v.0" ;; esac
+          "$(go env GOPATH)/bin/go-winres" simply --arch amd64 --manifest gui --icon none \
+            --product-version "$ver" --file-version "$ver" --product-name "$title recomp" \
+            --file-description "$title recomp installer" --original-filename "$OUT" \
+            --copyright "recomp-launcher contributors"
+      # the game repo's commit is the one the installer fetches and builds
+      # and the tag, or the short commit off a branch, is the version it shows
+      - run: |
+          v=${GITHUB_SHA::7}; case "$GITHUB_REF" in refs/tags/v*) v=$GITHUB_REF_NAME ;; esac
+          go build -ldflags "-X main.commit=${{ github.sha }} -X main.version=$v -X main.all=false ${{ matrix.ldflags }}" -o "out/$OUT" .
+      # tar keeps the executable bit, which a plain download loses
+      - if: runner.os == 'Linux'
+        run: tar -C out -czf "out/$OUT.tar.gz" "$OUT" && rm "out/$OUT"
+      # an app, so a double-click doesn't open a terminal
+      - if: runner.os == 'macOS'
+        run: |
+          app="out/RA2-Recomp-Installer.app"
+          mkdir -p "$app/Contents/MacOS"
+          mv "out/$OUT" "$app/Contents/MacOS/installer"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>installer</string>
+            <key>CFBundleIdentifier</key><string>net.sp00nz.RA2-Recomp-Installer</string>
+            <key>CFBundleName</key><string>RA2-Recomp-Installer</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          # ponytail: ad-hoc, not notarised. Unsigned, a downloaded bundle is
+          # "damaged" with no way past; ad-hoc gets "Open Anyway" in Privacy & Security
+          codesign --force --deep --sign - "$app"
+          (cd out && zip -qry "$OUT.zip" "RA2-Recomp-Installer.app" && rm -rf "RA2-Recomp-Installer.app")
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.OUT }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: out
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        # a tag with a hyphen (v0.1.0-alpha.1) is a pre-release
+        run: |
+          pre=; case "$GITHUB_REF_NAME" in *-*) pre=--prerelease ;; esac
+          (cd out && sha256sum -- * > SHA256SUMS.txt)   # so a download can be checked, and looked up
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber -R "$GITHUB_REPOSITORY" ||
+            gh release create "$GITHUB_REF_NAME" out/* -R "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $pre
