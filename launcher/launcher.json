@@ -1,6 +1,6 @@
 {
   "title": "Red Alert 2 & Yuri's Revenge",
-  "repo": "sp00nznet/redalert2-recomp",
+  "repo": "badrig217/redalert2-recomp",
   "accent": "#d0342c",
   "note": {
     "windows": "The first build takes 30 to 60 minutes and about 6 GB. Python, CMake, Ninja and the Visual Studio Build Tools (about 3 GB) are installed if they are missing; Windows asks for permission once.",

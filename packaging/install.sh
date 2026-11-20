@@ -4,12 +4,12 @@
 # ~/.local/share/redalert2-recomp, and drops setup/play wrappers plus menu
 # entries into ~/.local. Then runs the setup (needs your own game copy).
 #
-#   curl -fsSL https://raw.githubusercontent.com/sp00nznet/redalert2-recomp/main/packaging/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/badrig217/redalert2-recomp/main/packaging/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --yes --game-dir /path/to/game
 #   curl -fsSL .../install.sh | bash -s -- --no-setup   # deps + tree only
 #
 set -e
-REPO=https://github.com/sp00nznet/redalert2-recomp.git
+REPO=https://github.com/badrig217/redalert2-recomp.git
 DST=${XDG_DATA_HOME:-$HOME/.local/share}/redalert2-recomp
 BIN=$HOME/.local/bin
 APPLICATIONS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
