@@ -28,6 +28,7 @@
 #include "present.h"
 #include "hdvox.h"
 #include "mods.h"
+#include "cheats.h"
 #include "audio.h"
 #include "recomp_target.h"   /* the binary this build runs: run_lift.py --target */
 #include "resolutions.h"     /* the virtual display's modes (hl_EnumDisplayModes) */
@@ -305,6 +306,50 @@ HCURSOR host_menu_cursor(void) {
     uint32_t mouse = MEM32(RA2_MOUSE_VA);
     if (mouse && MEM8(mouse + 0x10)) return NULL;
     return g_game_cursor ? g_game_cursor : LoadCursor(NULL, IDC_ARROW);
+}
+
+/* ---- cheat hotkeys (docs/cheats.md) ---------------------------------------
+ * The presenter's thread sees the key; the cheat is an event the game thread
+ * must queue, under the machine lock, between two game frames. So the
+ * presenter posts a message to the game thread, and a WH_GETMESSAGE hook there
+ * takes it out of the game's own message loop and queues the event
+ * (cheats.c). The game never sees the message. */
+#define CHEAT_MSG    (WM_APP + 0x321)
+#define CHEAT_COOKIE 0x43483231u
+static DWORD g_cheat_thread;
+static HHOOK g_cheat_hook;
+
+static LRESULT CALLBACK cheat_messages(int code, WPARAM w, LPARAM l) {
+    if (code == HC_ACTION && w == PM_REMOVE) {
+        MSG* m = (MSG*)l;
+        if (m->message == CHEAT_MSG && (uint32_t)m->lParam == CHEAT_COOKIE) {
+            mach_enter();
+            int ok = ra2_cheat_enqueue((int)m->wParam, !host_menu_cursor(), timeGetTime());
+            mach_leave();
+            fprintf(stderr, "[cheats] %s %s\n", m->wParam == 2 ? "campaign victory" : "+30000",
+                    ok ? "queued" : "ignored (menu, mode, player or full queue)");
+            m->message = WM_NULL;
+        }
+    }
+    return CallNextHookEx(g_cheat_hook, code, w, l);
+}
+
+/* On the game thread, before the game starts. */
+static void cheats_install(void) {
+    MSG msg;
+    if (g_original) return;
+    g_cheat_thread = GetCurrentThreadId();
+    PeekMessageA(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);   /* the thread's queue, before any post */
+    g_cheat_hook = SetWindowsHookExA(WH_GETMESSAGE, cheat_messages, NULL, g_cheat_thread);
+    if (!g_cheat_hook) fprintf(stderr, "[cheats] no message hook (%lu): cheat hotkeys off\n", GetLastError());
+}
+
+/* The presenter: action 1 money, 2 campaign victory. */
+int host_cheat_post(int action) {
+    if (!g_cheat_hook) return 0;
+    if (PostThreadMessageA(g_cheat_thread, CHEAT_MSG, (WPARAM)action, (LPARAM)CHEAT_COOKIE)) return 1;
+    fprintf(stderr, "[cheats] post failed: %lu\n", GetLastError());
+    return 0;
 }
 
 /* ...and the screen it reports is the mode's, as it would be after a real
@@ -1758,6 +1803,7 @@ int main(int argc, char** argv) {
      * keys and buttons win over the live ones. Not --classic: that is a real
      * screen and a real mouse. */
     if (input_scripted() && g_classic) { fprintf(stderr, "a scripted run cannot use --classic\n"); return 1; }
+    cheats_install();
     input_start();
     if (g_headless) battleinfo_start_headless();
     if (!g_classic && !g_headless) present_start(g_scale_mode, g_fullscreen);
