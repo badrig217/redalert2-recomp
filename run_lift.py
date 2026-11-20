@@ -251,6 +251,8 @@ MODERN_CONTROLS_TARGETS = {
         'selection_count': 0x00A8ECC8, 'selection_data': 0x00A8ECBC,
         'unit_vtable': 0x007F5C70, 'infantry_vtable': 0x007EB058,
         'aircraft_vtable': 0x007E22A4,
+        'attack_move_arm': 'sub_00731AF0', 'attack_move_flag': 0x00B0FE58,
+        'receive_damage': 0x005F5390, 'current_player': 0x00A83D4C, 'mission': 0xAC,
     },
     'game': {
         'message': 0x0066A467, 'radar': 0x0062FE33, 'radar_stack': 0x44,
@@ -266,6 +268,8 @@ MODERN_CONTROLS_TARGETS = {
         'selection_count': 0x00A40C70, 'selection_data': 0x00A40C64,
         'unit_vtable': 0x007ADDF8, 'infantry_vtable': 0x007A3540,
         'aircraft_vtable': 0x0079B12C,
+        'attack_move_arm': 'sub_006F6570', 'attack_move_flag': 0x00AC1330,
+        'receive_damage': 0x005D3D20, 'current_player': 0x00A35DB4,
     },
 }
 
@@ -282,6 +286,74 @@ QUEUE_FIVE_TARGETS = {
         'time_get_time': 0x0079A524, 'sites': (0x0068119E, 0x006813EF),
     },
 }
+
+
+# Shift-queued moves (Modern controls, docs/modern-controls.md; the queue is
+# src/runtime/orders.c). 'frame' is in the main loop just after the game frame
+# count goes up, so it runs once a game frame and never while paused.
+# 'dispatch' is what a click on the ground calls to order the selection
+# (DisplayClass, ret 0xC: the object clicked, the cell, the action): each
+# object's MouseOverCell then ClickedAction, so a queued leg is the very order
+# a click gives. 'selection' and 'technos' are the game's DynamicVectorClass
+# lists of the selected objects and of every techno (items, capacity, count);
+# 'mission' is MissionClass::CurrentMission; the game's getter (vtable +0x184 /
+# +0x16C) answers the queued one, 8 bytes on, while it is -1.
+# The idle keys: 'center' is the CenterView command's Execute (WWKey, ret 4:
+# it centres on the selection); 'owner' is TechnoClass::Owner, 'unit_type'
+# UnitClass::Type, and 'harvester' UnitTypeClass's Harvester= flag (read by
+# its LoadFromINI next to the string).
+# Speed and pause: 'loop' is the last of the main loop's checks that skip the
+# game frame (a byte the EXIT event sets, read into al, then `test al, al;
+# jne`), so a pause skips it the same way; 'speed' is OptionsClass::GameSpeed,
+# which the main loop copies into its frame timer every pass, and 'session'
+# the session type (0 a campaign, 5 a skirmish).
+ORDERS_TARGETS = {
+    'gamemd': {
+        'frame': 0x0055DE9A, 'dispatch': 'sub_004AE750', 'display': 0x0087F7E8,
+        'selection': (0x00A8ECBC, 0x00A8ECC0, 0x00A8ECC8), 'technos': (0x00A8EC7C, 0x00A8EC88),
+        'mission': 0xAC, 'center': 'sub_00536E00', 'owner': 0x21C, 'unit_type': 0x6C4, 'harvester': 0xE0E,
+        'loop': 0x0055DE6A, 'speed': 0x00A8EB60, 'session': 0x00A8B238,
+    },
+    'game': {
+        'frame': 0x0054069D, 'dispatch': 'sub_0049E870', 'display': 0x008324E0,
+        'selection': (0x00A40C64, 0x00A40C68, 0x00A40C70), 'technos': (0x00A40C24, 0x00A40C30),
+        'mission': 0x98, 'center': 'sub_0051C0A0', 'owner': 0x1B4, 'unit_type': 0x5AC, 'harvester': 0xBA6,
+        'loop': 0x0054066D, 'speed': 0x00A40B18, 'session': 0x00A3D298,
+    },
+}
+
+
+def orders_patches(target):
+    """Modern controls: give units the next leg of a Shift-queued route. The
+    order routine works on the selection, so for each leg the selection is
+    briefly that one unit (its first item and count, put back after). Then an
+    idle key: select the unit orders.c picks (one Select() refuses is passed
+    over) and centre on it."""
+    t = ORDERS_TARGETS[target]
+    m = MODERN_CONTROLS_TARGETS[target]
+    items, cap, count = t['selection']
+    return {t['frame']: (
+        '{ extern int ra2_orders_next(uint32_t*, uint32_t*); '
+        'uint32_t _o_unit, _o_cell, _o_a = eax, _o_c = ecx, _o_d = edx; '
+        'while (ra2_orders_next(&_o_unit, &_o_cell)) { '
+        'uint32_t _o_items = MEM32(0x%08Xu), _o_n = MEM32(0x%08Xu); '
+        'if (!_o_items || !MEM32(0x%08Xu)) continue; '
+        'uint32_t _o_first = MEM32(_o_items); MEM32(_o_items) = _o_unit; MEM32(0x%08Xu) = 1; '
+        'PUSH32(esp, 1u); PUSH32(esp, _o_cell); PUSH32(esp, 0u); ecx = 0x%08Xu; RECOMP_CALL(%s); '
+        'MEM32(_o_items) = _o_first; MEM32(0x%08Xu) = _o_n; } '
+        '{ extern int ra2_orders_idle_request(void); extern uint32_t ra2_orders_idle_pick(int); '
+        'extern void ra2_orders_idle_selected(int, uint32_t, int); int _i_k = ra2_orders_idle_request(); '
+        'for (int _i_try = 0; _i_k && _i_try < 8; _i_try++) { uint32_t _i_u = ra2_orders_idle_pick(_i_k); '
+        'if (!_i_u) break; RECOMP_CALL(%s); ecx = _i_u; RECOMP_ICALL(MEM32(MEM32(_i_u) + 0x%X)); '
+        'int _i_ok = (eax & 0xFF) != 0; ra2_orders_idle_selected(_i_k, _i_u, _i_ok); '
+        'if (_i_ok) { PUSH32(esp, 0u); RECOMP_CALL(%s); break; } } } '
+        'eax = _o_a; ecx = _o_c; edx = _o_d; } '
+        '/* Modern controls: Shift-queued moves, idle keys (run_lift.py ORDERS_TARGETS) */'
+    ) % (items, count, cap, count, t['display'], t['dispatch'], count,
+         m['clear_fn'], m['select_slot'], t['center']),
+        # The speed and pause keys, every pass of the main loop.
+        t['loop']: ('{ extern int ra2_orders_loop(void); if (ra2_orders_loop()) SET_LO8(eax, 1); } '
+                    '/* Modern controls: game speed and pause (run_lift.py ORDERS_TARGETS) */')}
 
 
 def modern_controls_patches(target):
@@ -301,11 +373,31 @@ def modern_controls_patches(target):
         # The game has already read the Windows message here. Route right
         # presses through left-button bookkeeping only when no active
         # placement/order mode needs its original right-up cancellation.
+        # First, on this thread, what the attack-move key asked: arm the
+        # game's own attack-move (the command bar button's routine, which also
+        # says "nothing selected" or "unsupported"), or cancel it.
         t['message']: (
+            '{ extern int ra2_modern_attack_move_request(void); '
+            'int _am = ra2_modern_attack_move_request(); '
+            'if (_am == 1) { uint32_t _am_a = eax, _am_c = ecx, _am_d = edx; '
+            'RECOMP_CALL(%s); RECOMP_FLAGS_IN(); eax = _am_a; ecx = _am_c; edx = _am_d; } '
+            'else if (_am == 2) MEM8(0x%08Xu) = 0; } '
             '{ extern uint32_t ra2_modern_mouse_message(uint32_t, int); '
             'int special = %s; '
             'eax = ra2_modern_mouse_message(eax, special); } '
-            '/* optional F10 Modern controls */') % special_expr,
+            '/* optional F10 Modern controls */') % (t['attack_move_arm'], t['attack_move_flag'], special_expr),
+        # A scripted run logs the damage the player's side deals, with the
+        # attacker's mission, which tells an attack-move that fought on the way
+        # (mission 29) from a plain move (2) (tools/playtest.py
+        # skirmish-attackmove). After `sub esp, 0x14` the attacker is the
+        # fourth argument and the attacking house the seventh.
+        t['receive_damage']: (
+            '{ extern void ra2_hit_logged(uint32_t, uint32_t, uint32_t, uint32_t); '
+            'ra2_hit_logged(ecx, MEM32(esp + 0x30), MEM32(0x%08Xu), %s); } '
+            '/* attack-move test aid */') % (
+                t['current_player'],
+                'MEM32(esp + 0x24) ? MEM32(MEM32(esp + 0x24) + 0x%Xu) : 0xFFFFFFFFu' % t['mission']
+                if t.get('mission') else '0xFFFFFFFFu'),
         # Keep the mapped radar flags in the stack argument as well as DL;
         # later branches in this handler read the argument again.
         t['radar']: (
@@ -315,10 +407,13 @@ def modern_controls_patches(target):
             '/* swap radar left/right event flags in Modern mode */') % t['radar_stack'],
         # In Modern mode, plain left-clicks select objects or clear the
         # selection on open ground; contextual orders remain on right-click.
+        # The click's cell (esp+0xC, what the mouse-up handler is handed) goes
+        # to the Shift-queued moves first (orders_patches).
         # The mouse-up handler (0x004AB9B0) still selects a selectable target
         # when the action is None, so a click that must not touch the
         # selection (0xFFFFFFFE) also clears the target slot it reads.
         t['action']: (
+            '{ extern void ra2_orders_click_cell(uint32_t); ra2_orders_click_cell(MEM32(esp + 0xC)); } '
             '{ extern uint32_t ra2_modern_left_click_action(uint32_t, uint32_t, uint32_t, int, uint32_t, int); '
             'int special = %s; '
             'uint32_t target = MEM32(esp + 0x30); uint32_t vtable = target ? MEM32(target) : 0; '
@@ -420,6 +515,32 @@ def queue_five_patches(target):
     return {site: after_production_event() for site in t['sites']}
 
 
+# Sidebar grid hotkeys (Modern controls, docs/modern-controls.md). The in-game
+# message hook (0x006930A0 in Yuri's Revenge, 0x0066A400 in Red Alert 2) gets
+# every message's hwnd and the addresses of msg, wParam and lParam from the
+# window procedure, which reads msg again after it returns. Here its in-game
+# checks have passed and eax = &msg. The host turns Alt + a grid key into the
+# click a player would make on that sidebar slot's cameo, and the key into
+# WM_NULL, which the keyboard handler ignores (src/runtime/gridkeys.c). The
+# rest locates the sidebar for the host: the map object (its SidebarClass part
+# holds the active tab and the four tabs' strips), each strip's button-set
+# index, and the static cameo buttons (240 of 0x38 bytes, four sets of 60;
+# 0x006A4DC0 / 0x0067B660 build them).
+GRID_KEYS_TARGETS = {
+    'gamemd': {'site': 0x006930F5, 'map': 0x0087F7E8, 'active_tab': 0x539C, 'tabs': 0x1544,
+               'tab_size': 0xF94, 'tab_set': 0x38, 'buttons': 0x00B07E80},
+    'game': {'site': 0x0066A455, 'map': 0x008324E0, 'active_tab': 0x4ED8, 'tabs': 0x1540,
+             'tab_size': 0x4CC, 'tab_set': 0x34, 'buttons': 0x00AB9740},
+}
+
+
+def grid_keys_patches(target):
+    return {GRID_KEYS_TARGETS[target]['site']: (
+        '{ extern void ra2_gridkey_message(uint32_t, uint32_t, uint32_t, uint32_t); '
+        'ra2_gridkey_message(MEM32(esp + 0x28), eax, MEM32(esp + 0x30), MEM32(esp + 0x34)); } '
+        '/* sidebar grid hotkeys (Modern controls) */')}
+
+
 # The Cohen-Sutherland line clipper (game 0x00775620, gamemd 0x007BC2B0) clips
 # the outside point to an edge, recomputing the other coordinate from the point
 # itself, and loops until both outcodes are clear or share a bit. A line through
@@ -463,6 +584,147 @@ def launcher_patches(target):
             for va in LAUNCHER_SITES[target]}
 
 
+# The view on a map smaller than the screen (issue #27). 0x006D8640 keeps the
+# view's centre inside the map: y clamped to [ecx, eax], then x to [edi, esi],
+# each bound the map's edge plus or minus half the view. When the view is wider
+# (or taller) than the map, max < min and the clamp has no answer: a centre at
+# min is above max and moves there, the next frame it is below min and moves
+# back, so the view jumps every frame, and the game's scroll (it shifts the last
+# picture and draws only the new edge) leaves pieces of the map drawn twice.
+# Where max < min, both become their midpoint: the map centred, and no scrolling
+# along that axis. The bounds are all in registers just after `add eax, ecx`.
+# game.exe has the same function at 0x006A8C80.
+VIEW_CLAMP_SITES = {
+    'gamemd': 0x006D86BC,
+    'game': 0x006A8CFC,
+}
+
+
+def view_clamp_patches(target):
+    return {VIEW_CLAMP_SITES[target]:
+            'if ((int32_t)eax < (int32_t)ecx) ecx = eax = (uint32_t)(((int32_t)ecx + (int32_t)eax) / 2); '
+            'if ((int32_t)esi < (int32_t)edi) edi = esi = (uint32_t)(((int32_t)edi + (int32_t)esi) / 2); '
+            '/* remaster: a map smaller than the view, centred (issue #27, run_lift.py VIEW_CLAMP_SITES) */'}
+# UI scale (docs/presenter.md). The sidebar lays itself out from one rect,
+# set at 0x006A5130 (game.exe 0x0067B910): below the 158-line radar, 168 wide,
+# down to the bottom of the screen (0x00886F9C, its height). Every row of build
+# icons, its buttons and its bottom piece follow from that height. With a UI
+# scale of 2 or 3, the presenter's ra2_ui_sidebar_h() shortens it to a half or
+# a third of the screen, so the whole sidebar is in the top of its strip, and
+# the presenter draws that part 2 or 3 times larger; the battlefield stays 1:1.
+# The patch goes after the lea that computes the height, before its store.
+UI_SCALE_SITES = {
+    'gamemd': (0x006A5187, 0x006A51D0),
+    'game': (0x0067B937,),
+}
+
+
+#
+# The bar under the battlefield (the Options and Diplomacy tabs, 32 lines) is
+# laid out at the bottom of the screen from its height (0x0072FE98, game.exe
+# 0x006F4ECB: y = h - 32), and the tactical view is the screen less the
+# sidebar and that bar (0x0072AD20 and 0x0072AD90, game.exe 0x006F1F30:
+# h - 32). ra2_ui_view_h() takes another 32 * (s - 1) lines off the view, so
+# the presenter can draw the bar s times taller in them; the bar itself stays
+# where the game puts it. The patch goes after the sub, before the store.
+UI_VIEW_SITES = {
+    'gamemd': (0x0072AD6D, 0x0072ADC6),
+    'game': (0x006F1F7D,),
+}
+
+
+def ui_scale_patches(target):
+    return {**{va: '{ extern int32_t ra2_ui_sidebar_h(int32_t); eax = (uint32_t)ra2_ui_sidebar_h((int32_t)eax); } '
+                   '/* remaster: UI scale, the sidebar laid out in the top of its strip (run_lift.py UI_SCALE_SITES) */'
+               for va in UI_SCALE_SITES[target]},
+            **{va: '{ extern int32_t ra2_ui_view_h(int32_t); esi = (uint32_t)ra2_ui_view_h((int32_t)esi); } '
+                   '/* remaster: UI scale, room for the bar s times taller (run_lift.py UI_VIEW_SITES) */'
+               for va in UI_VIEW_SITES[target]}}
+
+
+# Battle info (docs/battle-info.md, src/runtime/battleinfo.c), each off until
+# ra2.ini or F10 turns it on.
+# * Health bars. TechnoClass's extras (gamemd 0x006F5190, game 0x006C2C40)
+#   draw the bar of a selected object, then of one the mouse is over and that
+#   is not selected: `mov al, [obj + IsMouseHovering]; test al, al` is that
+#   test. Right after the load the host may say "hovered" for any object
+#   (always) or a hurt one (damaged): Health against its type's Strength, the
+#   pair GetHealthPercentage (0x005F5C60, 0x005D4540) divides. ecx and edx are
+#   dead there.
+# * Build percentage. The sidebar's cameo loop (StripClass::Draw) reads the
+#   cameo's text, "Ready" or none, and draws it centred over the cameo. For a
+#   cameo whose factory is building and not on hold (the same tests the "On
+#   Hold" text makes later) the host hands it "42%" instead of none.
+# * Build time. The tooltip text ("Name\n$cost" in a static buffer) gets the
+#   type's build time from its GetBuildSpeed (vtable +0x88, frames), at the
+#   point both formats' paths join, before the game turns spaces into breaks.
+# * Orders. Every event the player sends is copied into the outgoing ring
+#   inline, at some 40 sites: `cmp [count], 0x80` (room?), the copy, then
+#   `inc reg; mov [count], reg`. Each store of the bumped count is counted.
+BATTLE_INFO_TARGETS = {
+    'gamemd': {
+        'hover': 0x006F5E37, 'obj': 'ebp', 'selected': 0x83, 'get_type': 0x88,
+        'strip_text': 0x006A9D94, 'text_slot': 0x40, 'entry_slot': 0x30, 'entry_factory': 0x64,
+        'entry_status': 0x68, 'factory_rate': 0x38, 'factory_held': 0x70,
+        'tooltip': 0x006A93B2, 'tooltip_buffer': 0x00B07BC4,
+        'out_count': 0x00A802C8,
+    },
+    'game': {
+        'hover': 0x006C389D, 'obj': 'esi', 'selected': 0x77, 'get_type': 0x84,
+        'strip_text': 0x0067FFFB, 'text_slot': 0x28, 'entry_slot': 0x1C, 'entry_factory': 0x60,
+        'entry_status': 0x64, 'factory_rate': 0x34, 'factory_held': 0x6C,
+        'tooltip': 0x0067F648, 'tooltip_buffer': 0x00AB9484,
+        'out_count': 0x00A32338,
+    },
+}
+
+
+def battle_info_patches(target, code, cs):
+    t = BATTLE_INFO_TARGETS[target]
+    obj = t['obj']
+    out = {
+        t['hover']: (
+            '{ extern int ra2_healthbars; extern int ra2_healthbar_force(int, int); '
+            'if (ra2_healthbars && !LO8(eax) && !MEM8(%s + 0x%X)) { int _hb_hp = (int32_t)MEM32(%s + 0x6C); '
+            'ecx = %s; RECOMP_ICALL(MEM32(MEM32(%s) + 0x%X)); '
+            'SET_LO8(eax, ra2_healthbar_force(_hb_hp, (int32_t)MEM32(eax + 0xA0))); } } '
+            '/* battle info: health bars, run_lift.py battle_info_patches */'
+        ) % (obj, t['selected'], obj, obj, obj, t['get_type']),
+        t['strip_text']: (
+            '{ extern int ra2_buildinfo; extern uint32_t ra2_build_pct_text(int); '
+            'uint32_t _bp_e = MEM32(esp + 0x%X), _bp_f = _bp_e ? MEM32(_bp_e + 0x%X) : 0; '
+            'if (ra2_buildinfo && !eax && !MEM8(esp + 0x14) && _bp_f && MEM32(_bp_f + 0x%X) && '
+            '!MEM8(_bp_f + 0x%X) && MEM32(_bp_e + 0x%X) != 2) { '
+            'eax = ra2_build_pct_text((int32_t)MEM32(_bp_f + 0x24)); MEM32(esp + 0x%X) = eax; } } '
+            '/* battle info: build %%, run_lift.py battle_info_patches */'
+        ) % (t['entry_slot'], t['entry_factory'], t['factory_rate'], t['factory_held'], t['entry_status'],
+             t['text_slot']),
+        t['tooltip']: (
+            '{ extern int ra2_buildinfo; extern void ra2_tooltip_time(uint32_t, int); '
+            'if (ra2_buildinfo && esi) { ecx = esi; RECOMP_ICALL(MEM32(MEM32(esi) + 0x88)); '
+            'ra2_tooltip_time(0x%08Xu, (int32_t)eax); } } '
+            '/* battle info: build time, run_lift.py battle_info_patches */'
+        ) % t['tooltip_buffer'],
+    }
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    count = t['out_count'].to_bytes(4, 'little')
+    room = b'\x81\x3d' + count + b'\x80\x00\x00\x00'          # cmp dword ptr [count], 0x80
+    i = code.find(room)
+    while i != -1:
+        bumped = None
+        for ins in md.disasm(code[i:i + 0x80], cs + i):
+            ops = ins.op_str
+            if ins.mnemonic == 'inc':
+                bumped = ops
+            elif ins.mnemonic == 'mov' and ops.startswith('dword ptr [0x%x], ' % t['out_count']):
+                if ops.split(', ')[1] in bumped:
+                    out[ins.address] = ('{ extern void ra2_order_added(void); ra2_order_added(); } '
+                                        '/* battle info: orders a minute, run_lift.py battle_info_patches */')
+                break
+        i = code.find(room, i + 1)
+    return out
+
+
 def apply_patches(body, patches):
     """Add each patch's C after the line that lifts its instruction."""
     for va, c in patches.items():
@@ -497,8 +759,11 @@ def targets():
                        run_seeds=RUN_SEEDS, hooks=HOOKS, exe_name='gamemd.exe', ini_name='RA2MD.INI',
                        title="Yuri's Revenge", game_frame=0x00A8ED84, stamp=0x3BDF544E,
                        patches=lambda code, cs: {**sidebar_rows_patches(code, cs), **HD_VOXEL_PATCHES,
-                                                 **modern_controls_patches('gamemd'), **queue_five_patches('gamemd'),
-                                                 **clip_line_patches('gamemd'), **launcher_patches('gamemd')}),
+                                                 **modern_controls_patches('gamemd'), **queue_five_patches('gamemd'), **orders_patches('gamemd'), **grid_keys_patches('gamemd'),
+                                                 **clip_line_patches('gamemd'), **launcher_patches('gamemd'),
+                                                 **view_clamp_patches('gamemd'),
+                                                 **ui_scale_patches('gamemd'),
+                                                 **battle_info_patches('gamemd', code, cs)}),
         'game': dict(exe=os.path.join(_HERE, 'game', 'game.exe'),
                      catalog=os.path.join(_HERE, 'work', 'game', 'functions.json'),
                      seeds=os.path.join(_HERE, 'work', 'game', 'rtti_seeds.json'),
@@ -512,8 +777,11 @@ def targets():
                      patches=lambda code, cs: {**sidebar_rows_patches(code, cs, 0x0067B000, 0x00683000,
                                                                      (0x0083962C, 0x00ABCD64)),
                                                **HD_VOXEL_PATCHES_GAME,
-                                               **modern_controls_patches('game'), **queue_five_patches('game'),
-                                               **clip_line_patches('game'), **launcher_patches('game')}),
+                                               **modern_controls_patches('game'), **queue_five_patches('game'), **orders_patches('game'), **grid_keys_patches('game'),
+                                               **clip_line_patches('game'), **launcher_patches('game'),
+                                               **view_clamp_patches('game'),
+                                               **ui_scale_patches('game'),
+                                               **battle_info_patches('game', code, cs)}),
     }
 
 
@@ -535,9 +803,28 @@ def write_target_header(out, name, t):
                            ('infantry_vtable', 'RA2_MODERN_INFANTRY_VTABLE'),
                            ('aircraft_vtable', 'RA2_MODERN_AIRCRAFT_VTABLE')):
             f.write('#define %s 0x%08Xu\n' % (macro, modern[key]))
+        f.write('#define RA2_ATTACK_MOVE_FLAG_VA 0x%08Xu   /* armed by the attack-move button */\n'
+                % modern['attack_move_flag'])
+        orders = ORDERS_TARGETS[name]
+        f.write('#define RA2_SELECTION_ITEMS_VA 0x%08Xu\n#define RA2_SELECTION_COUNT_VA 0x%08Xu\n'
+                % (orders['selection'][0], orders['selection'][2]))
+        f.write('#define RA2_TECHNOS_ITEMS_VA 0x%08Xu\n#define RA2_TECHNOS_COUNT_VA 0x%08Xu\n'
+                % orders['technos'])
+        f.write('#define RA2_ORDERS_MISSION_OFFSET 0x%Xu   /* MissionClass::CurrentMission */\n'
+                % orders['mission'])
+        f.write('#define RA2_CURRENT_PLAYER_VA 0x%08Xu\n#define RA2_TECHNO_OWNER_OFFSET 0x%Xu\n'
+                '#define RA2_UNIT_TYPE_OFFSET 0x%Xu\n#define RA2_UNITTYPE_HARVESTER_OFFSET 0x%Xu\n'
+                % (modern['current_player'], orders['owner'], orders['unit_type'], orders['harvester']))
+        f.write('#define RA2_GAME_SPEED_VA 0x%08Xu\n#define RA2_SESSION_TYPE_VA 0x%08Xu\n'
+                % (orders['speed'], orders['session']))
         for key, macro in (('count', 'RA2_QUEUE_FIVE_COUNT_VA'), ('index', 'RA2_QUEUE_FIVE_INDEX_VA'),
                            ('ring', 'RA2_QUEUE_FIVE_RING_VA'), ('stamps', 'RA2_QUEUE_FIVE_STAMPS_VA')):
             f.write('#define %s 0x%08Xu\n' % (macro, queue[key]))
+        grid = GRID_KEYS_TARGETS[name]
+        for key, macro in (('map', 'RA2_GRID_MAP_VA'), ('active_tab', 'RA2_GRID_ACTIVE_TAB'), ('tabs', 'RA2_GRID_TABS'),
+                           ('tab_size', 'RA2_GRID_TAB_SIZE'), ('tab_set', 'RA2_GRID_TAB_SET'),
+                           ('buttons', 'RA2_GRID_BUTTONS_VA')):
+            f.write('#define %s 0x%08Xu\n' % (macro, grid[key]))
 
 
 def exe_stamp(path):

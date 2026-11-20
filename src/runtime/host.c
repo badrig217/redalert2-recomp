@@ -23,11 +23,14 @@
 #include "native32.h"
 #include "recomp_trace.h"
 #include "input.h"
+#include "battleinfo.h"
 #include "oracle.h"
 #include "present.h"
 #include "hdvox.h"
 #include "mods.h"
+#include "audio.h"
 #include "recomp_target.h"   /* the binary this build runs: run_lift.py --target */
+#include "resolutions.h"     /* the virtual display's modes (hl_EnumDisplayModes) */
 
 extern const uint32_t ra2_entry_va;    /* recomp_dispatch.c */
 
@@ -38,6 +41,7 @@ static int g_last_dialog;             /* resource ID of the last RT_DIALOG looke
 
 static DWORD g_watchdog_s;
 unsigned ra2_clip_rounds;           /* the line clipper's round cap (run_lift.py clip_line_patches) */
+int ra2_gridkeys_arg(const char* mode);   /* gridkeys.c: --gridkeys alt|hover|off */
 static int   g_original;            /* --original: run the shipping code (oracle.c) */
 static int   g_headless;
 /* How the game is shown. The presenter (present.c) is the default: the display
@@ -530,7 +534,9 @@ long host_frame_count(void) {
 }
 
 static void count_frame(void) {
+    extern volatile LONG ra2_primary_blits;       /* hdvox.c: the menus are drawing */
     LONG n = InterlockedIncrement(&g_frames);
+    InterlockedIncrement(&ra2_primary_blits);
     if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
         fprintf(stderr, "[headless] frame %ld blitted to the primary\n", n);
 }
@@ -613,6 +619,40 @@ static void patch(void** vt, int slot, void* fn, void** real) {
     VirtualProtect(&vt[slot], 4, old, &old);
 }
 
+/* The game's Options screen lists the 16-bit modes DirectDraw enumerates.
+ * Windows 10 and 11 enumerate none at 16 bits on many displays, so the list
+ * was empty, and picking from it faulted in the game (it indexes its mode
+ * table with the combo box's -1). The display is virtual (SetDisplayMode is
+ * remembered, not applied), so the host lists the sizes F10 offers, 640x480
+ * first, as win32hle does on Linux and macOS. The game keeps its own filter:
+ * above 1024x768 only with [Video] AllowHiResModes=yes. */
+typedef HRESULT (WINAPI *dd_enum_t)(IDirectDraw*, DWORD, LPDDSURFACEDESC, LPVOID, LPDDENUMMODESCALLBACK);
+static dd_enum_t g_real_enum;           /* replaced, not called: the display is virtual */
+
+static HRESULT WINAPI hl_EnumDisplayModes(IDirectDraw* dd, DWORD flags, LPDDSURFACEDESC want, LPVOID ctx,
+                                          LPDDENUMMODESCALLBACK cb) {
+    (void)dd, (void)flags;
+    if (!cb) return DDERR_INVALIDPARAMS;
+    for (int i = -1; i < NRES; i++) {    /* 640x480, then F10's */
+        int w = i < 0 ? 640 : k_res[i][0], h = i < 0 ? 480 : k_res[i][1];
+        DDSURFACEDESC m = {0};
+        if (want && (want->dwFlags & DDSD_WIDTH) && want->dwWidth != (DWORD)w) continue;
+        if (want && (want->dwFlags & DDSD_HEIGHT) && want->dwHeight != (DWORD)h) continue;
+        if (want && (want->dwFlags & DDSD_PIXELFORMAT) && want->ddpfPixelFormat.dwRGBBitCount != 16) continue;
+        m.dwSize = sizeof m;
+        m.dwFlags = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT | DDSD_REFRESHRATE;
+        m.dwWidth = w, m.dwHeight = h, m.lPitch = w * 2, m.dwRefreshRate = 60;
+        m.ddpfPixelFormat.dwSize = sizeof m.ddpfPixelFormat;
+        m.ddpfPixelFormat.dwFlags = DDPF_RGB;
+        m.ddpfPixelFormat.dwRGBBitCount = 16;
+        m.ddpfPixelFormat.dwRBitMask = 0xF800, m.ddpfPixelFormat.dwGBitMask = 0x07E0;
+        m.ddpfPixelFormat.dwBBitMask = 0x001F;
+        if (cb(&m, ctx) == DDENUMRET_CANCEL) break;
+    }
+    fprintf(stderr, "[headless] EnumDisplayModes: the virtual display's %d modes at 16 bits\n", NRES + 1);
+    return DD_OK;
+}
+
 static void shim_DirectDrawCreate(void) {
     GUID* guid = (GUID*)(uintptr_t)ARG(0);
     IDirectDraw** out = (IDirectDraw**)(uintptr_t)ARG(1);
@@ -621,6 +661,7 @@ static void shim_DirectDrawCreate(void) {
         void** vt = *(void***)*out;
         patch(vt, 2, (void*)hl_DDRelease, (void**)&g_real_ddrelease);
         patch(vt, 6, (void*)hl_CreateSurface, (void**)&g_real_surf);
+        patch(vt, 8, (void*)hl_EnumDisplayModes, (void**)&g_real_enum);
         patch(vt, 12, (void*)hl_GetDisplayMode, (void**)&g_real_getmode);
         patch(vt, 20, (void*)hl_SetCooperativeLevel, (void**)&g_real_coop);
         patch(vt, 21, (void*)hl_SetDisplayMode, (void**)&g_real_mode);
@@ -640,21 +681,125 @@ typedef HRESULT (WINAPI *ds_buffer_t)(IDirectSound*, LPCDSBUFFERDESC, LPDIRECTSO
 static ds_create_t g_real_dscreate;
 static ds_buffer_t g_real_dsbuffer;
 
+/* --audio-trace: every IDirectSound and IDirectSoundBuffer method called, by
+ * whom (the module the call returns to: the lifted game is this exe, Bink is
+ * binkw32.dll), counted, with the interfaces asked for by QueryInterface and
+ * each buffer's format. Each vtable slot is replaced by a thunk that counts and
+ * jumps on to the method, so the calls are the game's own and every object of
+ * that class is seen, whoever made it. What audio_wasapi.c has to answer. */
+static int g_audio_trace;
+static int g_audio_wasapi;              /* --audio wasapi; DirectSound is the default */
+#define TR_SLOTS 21                     /* IDirectSoundBuffer's; IDirectSound has 11 */
+#define TR_VTS 4                        /* the device's, and up to 3 buffer classes */
+static void** g_tr_vt[TR_VTS];
+static int g_tr_kind[TR_VTS];           /* 0 the device, 1 a buffer */
+static void* g_tr_real[TR_VTS * TR_SLOTS];
+static volatile LONG g_tr_count[TR_VTS * TR_SLOTS];
+static const char* const k_tr_ds[] = { "QueryInterface", "AddRef", "Release", "CreateSoundBuffer", "GetCaps",
+    "DuplicateSoundBuffer", "SetCooperativeLevel", "Compact", "GetSpeakerConfig", "SetSpeakerConfig", "Initialize" };
+static const char* const k_tr_buf[] = { "QueryInterface", "AddRef", "Release", "GetCaps", "GetCurrentPosition",
+    "GetFormat", "GetVolume", "GetPan", "GetFrequency", "GetStatus", "Initialize", "Lock", "Play",
+    "SetCurrentPosition", "SetFormat", "SetVolume", "SetPan", "SetFrequency", "Stop", "Unlock", "Restore" };
+
+static const char* tr_name(int i) {
+    int v = i / TR_SLOTS, s = i % TR_SLOTS;
+    return g_tr_kind[v] ? k_tr_buf[s] : s < 11 ? k_tr_ds[s] : "?";
+}
+
+/* frame: the method's stack at entry ([0] the return address, [1] this, [2]..
+ * its arguments) */
+static void __stdcall tr_seen(int i, const uint32_t* frame) {
+    int s = i % TR_SLOTS, buf = g_tr_kind[i / TR_SLOTS];
+    if (InterlockedIncrement(&g_tr_count[i]) == 1) {
+        char mod[MAX_PATH] = "?";
+        HMODULE m;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)(uintptr_t)frame[0], &m))
+            GetModuleFileNameA(m, mod, sizeof mod);
+        fprintf(stderr, "[audio-trace] first %s::%s from %s+0x%X\n", buf ? "IDirectSoundBuffer" : "IDirectSound",
+                tr_name(i), strrchr(mod, '\\') ? strrchr(mod, '\\') + 1 : mod, frame[0] - (uint32_t)(uintptr_t)m);
+    }
+    if (s == 0) {                       /* QueryInterface(this, riid, out) */
+        const GUID* g = (const GUID*)(uintptr_t)frame[2];
+        if (g) fprintf(stderr, "[audio-trace] %s QueryInterface {%08lX-%04X-%04X}\n", buf ? "buffer" : "device",
+                       g->Data1, g->Data2, g->Data3);
+    } else if (!buf && s == 3) {        /* CreateSoundBuffer(this, desc, out, outer) */
+        const DSBUFFERDESC* d = (const DSBUFFERDESC*)(uintptr_t)frame[2];
+        const WAVEFORMATEX* w = d ? d->lpwfxFormat : NULL;
+        if (d) fprintf(stderr, "[audio-trace] CreateSoundBuffer flags 0x%lX bytes %lu format %u %luHz %ubit %uch\n",
+                       d->dwFlags, d->dwBufferBytes, w ? w->wFormatTag : 0, w ? w->nSamplesPerSec : 0,
+                       w ? w->wBitsPerSample : 0, w ? w->nChannels : 0);
+    }
+}
+
+#define TR_THUNK(v, s) static __declspec(naked) void tr_##v##_##s(void) { \
+    __asm mov eax, esp __asm push eax __asm push (v * TR_SLOTS + s) __asm call tr_seen \
+    __asm jmp dword ptr [g_tr_real + (v * TR_SLOTS + s) * 4] }
+#define TR_ROW(v) TR_THUNK(v, 0) TR_THUNK(v, 1) TR_THUNK(v, 2) TR_THUNK(v, 3) TR_THUNK(v, 4) TR_THUNK(v, 5) \
+    TR_THUNK(v, 6) TR_THUNK(v, 7) TR_THUNK(v, 8) TR_THUNK(v, 9) TR_THUNK(v, 10) TR_THUNK(v, 11) TR_THUNK(v, 12) \
+    TR_THUNK(v, 13) TR_THUNK(v, 14) TR_THUNK(v, 15) TR_THUNK(v, 16) TR_THUNK(v, 17) TR_THUNK(v, 18) \
+    TR_THUNK(v, 19) TR_THUNK(v, 20)
+TR_ROW(0) TR_ROW(1) TR_ROW(2) TR_ROW(3)
+#define TR_REF(v) tr_##v##_0, tr_##v##_1, tr_##v##_2, tr_##v##_3, tr_##v##_4, tr_##v##_5, tr_##v##_6, tr_##v##_7, \
+    tr_##v##_8, tr_##v##_9, tr_##v##_10, tr_##v##_11, tr_##v##_12, tr_##v##_13, tr_##v##_14, tr_##v##_15, \
+    tr_##v##_16, tr_##v##_17, tr_##v##_18, tr_##v##_19, tr_##v##_20
+static void (* const g_tr_thunk[TR_VTS * TR_SLOTS])(void) = { TR_REF(0), TR_REF(1), TR_REF(2), TR_REF(3) };
+
+/* An object's vtable into the trace, once per class. */
+static void tr_object(void* obj, int buf) {
+    static CRITICAL_SECTION lock;
+    static LONG init;
+    void** vt = obj ? *(void***)obj : NULL;
+    int v, n = buf ? TR_SLOTS : 11;
+    if (!g_audio_trace || !vt) return;
+    if (!InterlockedExchange(&init, 1)) InitializeCriticalSection(&lock);
+    EnterCriticalSection(&lock);
+    for (v = 0; v < TR_VTS && g_tr_vt[v] && g_tr_vt[v] != vt; v++) {}
+    if (v < TR_VTS && !g_tr_vt[v]) {
+        g_tr_vt[v] = vt, g_tr_kind[v] = buf;
+        for (int s = 0; s < n; s++)
+            patch(vt, s, (void*)g_tr_thunk[v * TR_SLOTS + s], &g_tr_real[v * TR_SLOTS + s]);
+    } else if (v == TR_VTS) fprintf(stderr, "[audio-trace] a 5th vtable: not traced\n");
+    LeaveCriticalSection(&lock);
+}
+
+/* Every 10 s while the counts move: the counts so far. */
+static DWORD WINAPI tr_report(LPVOID unused) {
+    LONG last = -1;
+    (void)unused;
+    for (;;) {
+        LONG total = 0;
+        Sleep(10000);
+        for (int i = 0; i < TR_VTS * TR_SLOTS; i++) total += g_tr_count[i];
+        if (total == last) continue;
+        last = total;
+        for (int i = 0; i < TR_VTS * TR_SLOTS; i++)
+            if (g_tr_count[i])
+                fprintf(stderr, "[audio-trace] count %d:%s %ld\n", i / TR_SLOTS, tr_name(i), g_tr_count[i]);
+    }
+}
+
 static HRESULT WINAPI hl_CreateSoundBuffer(IDirectSound* ds, LPCDSBUFFERDESC d, LPDIRECTSOUNDBUFFER* out, LPUNKNOWN u) {
     DSBUFFERDESC g = { 0 };
+    HRESULT hr;
     if (d && !(d->dwFlags & DSBCAPS_PRIMARYBUFFER)) {
         memcpy(&g, d, d->dwSize < sizeof g ? d->dwSize : sizeof g);   /* dwSize stays the game's */
         g.dwFlags |= DSBCAPS_GLOBALFOCUS;
         d = &g;
     }
-    return g_real_dsbuffer(ds, d, out, u);
+    hr = g_real_dsbuffer(ds, d, out, u);
+    if (hr == DS_OK && out) tr_object(*out, 1);
+    return hr;
 }
 
 static HRESULT WINAPI hl_DirectSoundCreate(LPCGUID guid, LPDIRECTSOUND* out, LPUNKNOWN outer) {
-    HRESULT hr = g_real_dscreate(guid, out, outer);
+    /* --audio wasapi: ours (audio_wasapi.c), which plays in or out of focus */
+    HRESULT hr = g_audio_wasapi ? audio_wasapi_create(out) : g_real_dscreate(guid, out, outer);
     if (hr == DS_OK && !g_real_dsbuffer)
         patch(*(void***)*out, 3, (void*)hl_CreateSoundBuffer, (void**)&g_real_dsbuffer);
-    fprintf(stderr, "[sound] DirectSoundCreate -> 0x%08lX (buffers play out of focus)\n", hr);
+    if (hr == DS_OK) tr_object(*out, 0);
+    fprintf(stderr, "[sound] DirectSoundCreate -> 0x%08lX (%s)\n", hr,
+            g_audio_wasapi ? "WASAPI" : "buffers play out of focus");
     return hr;
 }
 
@@ -688,8 +833,52 @@ static long g_recorded;
  * CRT ended the process with 0xC0000409. */
 static CRITICAL_SECTION g_rec_lock;
 
+/* With --audio wasapi the recording has sound: the mix (before --mute's
+ * gain) as 16-bit stereo through a named pipe, ffmpeg's second input. Written
+ * by a thread of its own at the clock's pace, silence where the mixer has
+ * nothing (before the game opens its sound), so the sound keeps time with
+ * the picture. The pipe never blocks: ffmpeg reads its inputs as it likes,
+ * and a close must not wait on a write. */
+static HANDLE g_rec_pipe = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_rec_alock;
+
+static DWORD WINAPI record_audio(LPVOID unused) {
+    static int16_t pcm[2 * 48000];             /* up to a second at a time */
+    int rate = audio_wasapi_rate(), connected = 0;
+    long long due = 0, sent = 0;               /* frames */
+    uint8_t* held = (uint8_t*)pcm;             /* what the pipe did not take yet */
+    DWORD nheld = 0, t0 = 0;
+    (void)unused;
+    for (;;) {
+        Sleep(20);
+        EnterCriticalSection(&g_rec_alock);
+        if (g_rec_pipe == INVALID_HANDLE_VALUE) { LeaveCriticalSection(&g_rec_alock); return 0; }   /* closed */
+        if (!connected) {                      /* ffmpeg opens it once it has the first picture */
+            connected = ConnectNamedPipe(g_rec_pipe, NULL) || GetLastError() == ERROR_PIPE_CONNECTED;
+            if (connected) t0 = GetTickCount(), audio_wasapi_tap(1);
+        }
+        if (connected && !nheld) {
+            due = (long long)(GetTickCount() - t0) * rate / 1000;
+            int want = (int)(due - sent < 48000 ? due - sent : 48000), n = want > 0 ? audio_wasapi_tap_read(pcm, want) : 0;
+            /* the mixer runs ahead by a buffer or so; short by more than
+             * 100 ms, it is not running: silence for the rest */
+            if (want - n > rate / 10) memset(pcm + 2 * n, 0, (size_t)(want - n) * 4), n = want;
+            sent += n, held = (uint8_t*)pcm, nheld = (DWORD)n * 4;
+        }
+        while (nheld) {
+            DWORD w = 0;
+            if (!WriteFile(g_rec_pipe, held, nheld, &w, NULL) || !w) break;   /* full: the rest next time */
+            held += w, nheld -= w;
+        }
+        LeaveCriticalSection(&g_rec_alock);
+    }
+}
+
 static void record_close(void) {
     EnterCriticalSection(&g_rec_lock);
+    EnterCriticalSection(&g_rec_alock);        /* ffmpeg ends at the end of both inputs */
+    if (g_rec_pipe != INVALID_HANDLE_VALUE) CloseHandle(g_rec_pipe), g_rec_pipe = INVALID_HANDLE_VALUE;
+    LeaveCriticalSection(&g_rec_alock);
     if (g_ffmpeg) {
         _pclose(g_ffmpeg);
         g_ffmpeg = NULL;
@@ -765,7 +954,7 @@ int host_frame_hd(uint32_t* out, int maxw, int maxh, int* pw, int* ph) {
     if (!snapshot(&w, &h, &bpp, &pitch)) { LeaveCriticalSection(&g_snap_lock); return -1; }
     int N = ra2_vox_scale();
     int ok = bpp == 16 && N * w <= maxw && N * h <= maxh;
-    if (ok) hdvox_compose(g_snap, pitch, w, h, out);
+    if (ok) ok = hdvox_compose(g_snap, pitch, w, h, out, N);   /* 0: the scale changed just now */
     LeaveCriticalSection(&g_snap_lock);
     *pw = w;
     *ph = h;
@@ -796,7 +985,7 @@ int host_frame_overlay(uint32_t* base, uint32_t* ov, int maxw, int maxh, int* pw
                 row[x] = (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
             }
         }
-        N = hdvox_overlay(g_snap, pitch, w, h, ov, dx, dy, dw, dh);   /* display scale: Nx, or 1 if AA */
+        N = hdvox_overlay(g_snap, pitch, w, h, ov, N, dx, dy, dw, dh);   /* display scale: Nx, or 1 if AA */
     }
     LeaveCriticalSection(&g_snap_lock);
     *pw = w;
@@ -809,16 +998,20 @@ int host_frame_overlay(uint32_t* base, uint32_t* ov, int maxw, int maxh, int* pw
  * that showed the units at 1x (tools/playtest.py hd-scroll). */
 static DWORD WINAPI hd_probe(LPVOID unused) {
     uint32_t* px = (uint32_t*)malloc((size_t)4096 * 2160 * 4);
+    /* RA2_HDVOX_CHECK: the overlay path too, which counts what it leaves
+     * outside the records (hdvox.c, playtest hd-rescale) */
+    uint32_t* ov = getenv("RA2_HDVOX_CHECK") ? (uint32_t*)malloc((size_t)4096 * 2160 * 4) : NULL;
     long seen = -1;
     (void)unused;
     if (!px) return 0;
     for (;;) {
-        int w, h;
+        int w, h, dx, dy, dw, dh;
         Sleep(16);
         long n = host_frame_count();
         if (n == seen) continue;
         seen = n;
         host_frame_hd(px, 4096, 2160, &w, &h);
+        if (ov) host_frame_overlay(px, ov, 4096, 2160, &w, &h, &dx, &dy, &dw, &dh);
     }
 }
 
@@ -849,15 +1042,66 @@ static DWORD WINAPI hd_frame_dumper(LPVOID unused) {
     return 0;
 }
 
+/* --shots DIR: every 3 s, the game's picture at its own size as shot_NN.bmp.
+ * The recording is scaled into the menus' 800x600, which at 3440x1440 is a
+ * quarter of the pixels: too few to tell one line of text from two
+ * (tools/playtest.py reads these for res-campaign-3440x1440). */
+static const char* g_shots_dir;
+
+static DWORD WINAPI shot_dumper(LPVOID unused) {
+    static uint32_t row[4096];                /* written from g_snap a row at a time: this is a
+                                                 32-bit process, and a frame-sized buffer of its
+                                                 own is 35 MB of the game's address space */
+    (void)unused;
+    for (int n = 0; n < 100; ) {
+        int w, h, bpp, pitch;
+        Sleep(3000);
+        EnterCriticalSection(&g_snap_lock);
+        if (!snapshot(&w, &h, &bpp, &pitch)) { LeaveCriticalSection(&g_snap_lock); continue; }
+        char path[MAX_PATH];
+        _snprintf(path, sizeof path - 1, "%s/shot_%02d.bmp", g_shots_dir, n++), path[sizeof path - 1] = 0;
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            BITMAPINFOHEADER ih = { sizeof ih, w, -h, 1, 32, BI_RGB };
+            uint32_t off = 14 + sizeof ih, size = off + (uint32_t)w * h * 4, zero = 0;
+            fwrite("BM", 1, 2, f);
+            fwrite(&size, 4, 1, f), fwrite(&zero, 4, 1, f), fwrite(&off, 4, 1, f);
+            fwrite(&ih, sizeof ih, 1, f);
+            for (int y = 0; y < h; y++) {
+                const uint8_t* src = g_snap + (size_t)y * pitch;
+                if (bpp == 16) {
+                    for (int x = 0; x < w; x++) {
+                        uint16_t p = ((const uint16_t*)src)[x];
+                        uint32_t r = (p >> 11) & 31, g = (p >> 5) & 63, b = p & 31;
+                        row[x] = (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
+                    }
+                    fwrite(row, 4, (size_t)w, f);
+                } else fwrite(src, 4, (size_t)w, f);
+            }
+            fclose(f);
+        }
+        LeaveCriticalSection(&g_snap_lock);
+    }
+    return 0;
+}
+
 static DWORD WINAPI recorder(LPVOID unused) {
     static uint32_t row[4096];
     uint32_t* frame = (uint32_t*)malloc((size_t)4096 * 2160 * 4);
-    DWORD next = GetTickCount();
+    DWORD start = GetTickCount();
+    unsigned long tick = 0;
     (void)unused;
     if (!frame) return 0;
+    /* the sound's rate first: opening the device took over 3 s under load,
+     * and the recording started without its sound */
+    for (int i = 0; g_audio_wasapi && i < 10 && !audio_wasapi_start(); i++) {}
+    if (g_audio_wasapi && !audio_wasapi_rate()) fprintf(stderr, "[record] no sound: the mixer never started\n");
+    start = GetTickCount();
     for (;;) {
         int w, h;
-        next += 33;
+        /* 30 a second exactly (not every 33 ms, 1% fast), so a recording's
+         * sound, which is in real time, stays with its picture */
+        DWORD next = start + (DWORD)(++tick * 1000 / 30);
         { LONG wait = (LONG)(next - GetTickCount()); if (wait > 0) Sleep(wait); }
         if (!host_frame(frame, 4096, 2160, &w, &h)) continue;
         EnterCriticalSection(&g_rec_lock);
@@ -870,10 +1114,23 @@ static DWORD WINAPI recorder(LPVOID unused) {
             int k = (w + 1279) / 1280;
             g_rec_w = (DWORD)(w / k) & ~1u;
             g_rec_h = (DWORD)(h / k) & ~1u;
+            char sound[160] = "";
+            if (g_audio_wasapi && audio_wasapi_rate()) {
+                char pipe[64];
+                _snprintf(pipe, sizeof pipe - 1, "\\\\.\\pipe\\ra2-record-%lu", GetCurrentProcessId());
+                pipe[sizeof pipe - 1] = 0;
+                g_rec_pipe = CreateNamedPipeA(pipe, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_NOWAIT, 1,
+                                              1 << 18, 0, 0, NULL);
+                if (g_rec_pipe != INVALID_HANDLE_VALUE) {
+                    _snprintf(sound, sizeof sound - 1, "-f s16le -ar %d -ac 2 -i %s -c:a aac -b:a 160k ",
+                              audio_wasapi_rate(), pipe);
+                    CloseHandle(CreateThread(NULL, 0, record_audio, NULL, 0, NULL));
+                }
+            }
             _snprintf(cmd, sizeof cmd - 1, "ffmpeg -y -loglevel error -f rawvideo -pix_fmt bgr0 "
-                      "-s %lux%lu -r 30 -i - -c:v libx264 -pix_fmt yuv420p \"%s\"", g_rec_w, g_rec_h, g_record);
+                      "-s %lux%lu -r 30 -i - %s-c:v libx264 -pix_fmt yuv420p \"%s\"", g_rec_w, g_rec_h, sound, g_record);
             g_ffmpeg = _popen(cmd, "wb");
-            fprintf(stderr, "[record] %lux%lu -> %s\n", g_rec_w, g_rec_h, g_record);
+            fprintf(stderr, "[record] %lux%lu%s -> %s\n", g_rec_w, g_rec_h, *sound ? " with sound" : "", g_record);
         }
         if (g_recorded == 0 || g_recorded % 300 == 0) {
             uint32_t sum = 0;
@@ -1034,6 +1291,13 @@ static void CALLBACK timer_tramp(UINT id, UINT msg, DWORD_PTR user, DWORD_PTR d1
     InterlockedDecrement(&g_timers[i].inflight);
 }
 
+int host_guest_timer_busy(void) {
+    DWORD me = GetCurrentThreadId();
+    for (int k = 0; k < MAX_TIMERS; k++)
+        if (g_timers[k].inflight && g_timers[k].in_thread != me) return 1;
+    return 0;
+}
+
 static void shim_timeSetEvent(void) {
     UINT flags = ARG(4);
     int i = -1;
@@ -1125,13 +1389,29 @@ static int g_debuglog;
 /* --mute: this process's audio session at zero (Vista and later: waveOut's
  * volume is the session's, and DirectSound and Bink play in the same
  * session). Held every second, since the game opens its devices later. For
- * test runs on a machine someone is using. */
+ * test runs on a machine someone is using.
+ *
+ * Windows keeps that volume for the program (by its path) after it exits,
+ * and the Volume mixer doesn't show it: its slider is the session's master
+ * volume, this is the channels'. So after a test run the game played
+ * silently from the same ra2.exe: the session at 100 in the mixer, its
+ * meter moving, nothing reaching the speakers. A run without --mute puts the
+ * channels back at full, held for the first 10 s for the same reason. */
 static DWORD WINAPI mute_thread(LPVOID unused) {
     (void)unused;
     for (;;) {
         waveOutSetVolume(NULL, 0);
         Sleep(1000);
     }
+}
+
+static DWORD WINAPI unmute_thread(LPVOID unused) {
+    (void)unused;
+    for (int i = 0; i < 10; i++) {
+        waveOutSetVolume(NULL, 0xFFFFFFFFu);
+        Sleep(1000);
+    }
+    return 0;
 }
 
 void ra2_hook_debuglog(void) {
@@ -1278,6 +1558,8 @@ int main(int argc, char** argv) {
     const char* mod = NULL;             /* --mod: a mod in mods\<game> (mods.c) */
     char exe_full[MAX_PATH], game_full[MAX_PATH];
     int run = 0;
+    int muted = 0;                      /* --mute: a gain of 0 with WASAPI, else mute_thread; unmuted: unmute_thread */
+    const char* audio = NULL;           /* --audio: dsound or wasapi, else ra2.ini's */
     /* stderr unbuffered: the log is the evidence, and the game leaves through
      * ExitProcess, which flushes nothing with the C runtime linked in (/MT):
      * a run that exited cleanly lost its last 4 KB, menus and all. */
@@ -1311,22 +1593,32 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         int n = recomp_trace_arg(argc, argv, i);
         if (!n) n = input_arg(argc, argv, i);
+        if (!n) n = battleinfo_arg(argc, argv, i);
         if (n) { i += n - 1; continue; }
         if (!strcmp(argv[i], "--run")) run = 1;
         else if (!strcmp(argv[i], "--headless")) g_headless = 1;
         else if (!strcmp(argv[i], "--classic")) g_classic = 1;
+        else if (!strcmp(argv[i], "--gridkeys") && i + 1 < argc && ra2_gridkeys_arg(argv[i + 1])) i++;
         else if (!strcmp(argv[i], "--fullscreen")) g_fullscreen = 1;
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc && present_mode_from_name(argv[i + 1]) >= 0)
             g_scale_mode = present_mode_from_name(argv[++i]);
         else if (!strcmp(argv[i], "--debuglog")) g_debuglog = 1;
+        else if (!strcmp(argv[i], "--controls") && i + 1 < argc) present_force_controls(argv[++i]);
         else if (!strcmp(argv[i], "--hd-scale") && i + 1 < argc) ra2_vox_set_scale(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--hd-voxels")) hdvox_configure(1, NULL);
-        else if (!strcmp(argv[i], "--mute")) CloseHandle(CreateThread(NULL, 0, mute_thread, NULL, 0, NULL));
+        else if (!strcmp(argv[i], "--mute")) muted = 1;
+        else if (!strcmp(argv[i], "--audio") && i + 1 < argc) audio = argv[++i];
+        else if (!strcmp(argv[i], "--audio-trace")) g_audio_trace = 1;
         else if (!strcmp(argv[i], "--hd-voxels-dump") && i + 1 < argc) {
             static char dir[MAX_PATH];
             GetFullPathNameA(argv[++i], MAX_PATH, dir, NULL);   /* the run chdirs into game/ */
             hdvox_configure(1, dir);
             g_hd_frames_dir = dir;
+        }
+        else if (!strcmp(argv[i], "--shots") && i + 1 < argc) {
+            static char dir[MAX_PATH];
+            GetFullPathNameA(argv[++i], MAX_PATH, dir, NULL);   /* the run chdirs into game/ */
+            g_shots_dir = dir;
         }
         else if (!strcmp(argv[i], "--original")) g_original = 1;
         else if (!strcmp(argv[i], "--probe") && i + 1 < argc && g_nprobe < MAX_PROBES)
@@ -1341,13 +1633,30 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--callbacks")) native32_trace_callbacks = 1;
         else {
             printf("usage: ra2 [--run] [--headless | --classic | [--fullscreen] [--scale sharp|smooth|crt|nearest|integer]] [--record out.mp4] [--frames N] [--exe game\\" RA2_EXE_NAME "] [--game game] [--mod NAME|none]\n"
-                   "           [--press DLG:CTRL@s] [--select DLG:CTRL=N@s] [--waitlog TEXT@s] [--move|--click x,y@s] [--key [c][s][a]+vk@s] [--wait VA@s]\n"
-                   "           [--watchdog S] [--probe VA] [--debuglog] [--original] [--native-trace] [--callbacks]\n"
-                   "           [--hd-voxels] [--hd-scale 2|3] [--hd-voxels-dump DIR] [--mute] [--args FILE]\n");
+                   "           [--press DLG:CTRL@s] [--select DLG:CTRL=N@s] [--waitlog TEXT@s] [--move|--click x,y@s] [--key [c][s][a]+vk@s] [--wait VA@s] [--resolution WxH@s]\n"
+                   "           [--watchdog S] [--probe VA] [--debuglog] [--controls classic|modern] [--original] [--native-trace] [--callbacks]\n"
+                   "           [--hd-voxels] [--hd-scale 2|3] [--hd-scale N@s] [--hd-voxels-dump DIR] [--shots DIR] [--mute] [--args FILE]\n"
+                   "           [--audio dsound|wasapi] [--audio-trace] [--healthbars selected|damaged|always] [--buildinfo] [--overlay]\n");
             recomp_trace_help();
             return argv[i][1] == 'h' || argv[i][2] == 'h' ? 0 : 1;
         }
     }
+    {   /* the sound: --audio, else audio= under [present] in ra2.ini beside ra2.exe */
+        static char v[16];
+        char ini[MAX_PATH], *slash;
+        GetModuleFileNameA(NULL, ini, MAX_PATH);
+        slash = strrchr(ini, '\\');
+        strcpy_s(slash ? slash + 1 : ini, MAX_PATH - (slash ? (slash + 1 - ini) : 0), "ra2.ini");
+        if (!audio) GetPrivateProfileStringA("present", "audio", "dsound", v, sizeof v, ini), audio = v;
+        g_audio_wasapi = !_stricmp(audio, "wasapi");
+        if (!g_audio_wasapi && _stricmp(audio, "dsound")) { fprintf(stderr, "--audio: dsound or wasapi\n"); return 1; }
+    }
+    /* --mute with WASAPI is the mixer's gain, and nothing outlives the run;
+     * with DirectSound it is the process's waveOut volume (mute_thread), and
+     * without --mute unmute_thread undoes a silence an earlier run left */
+    if (muted && g_audio_wasapi) audio_wasapi_gain(0.0f);
+    else CloseHandle(CreateThread(NULL, 0, muted ? mute_thread : unmute_thread, NULL, 0, NULL));
+    if (g_audio_trace) CloseHandle(CreateThread(NULL, 0, tr_report, NULL, 0, NULL));
     if (g_record && g_classic) { fprintf(stderr, "--record needs the virtual display (not --classic)\n"); return 1; }
     GetFullPathNameA(exe, MAX_PATH, exe_full, NULL);
     GetFullPathNameA(game, MAX_PATH, game_full, NULL);
@@ -1375,6 +1684,7 @@ int main(int argc, char** argv) {
     InitializeCriticalSection(&g_primary_lock);
     InitializeCriticalSection(&g_snap_lock);
     InitializeCriticalSection(&g_rec_lock);
+    InitializeCriticalSection(&g_rec_alock);
     /* Headless and the presenter share the virtual display. The presenter
      * keeps the game's message boxes real (a player answers them) and its
      * single-instance mutexes as they are. */
@@ -1399,8 +1709,10 @@ int main(int argc, char** argv) {
         if (getenv("RA2_PROFILE")) CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL));
         if (g_record) CloseHandle(CreateThread(NULL, 0, recorder, NULL, 0, NULL));
         input_start();
+        if (g_headless) battleinfo_start_headless();
         if (!g_classic && !g_headless) present_start(g_scale_mode, g_fullscreen);
         if (g_hd_frames_dir) CloseHandle(CreateThread(NULL, 0, hd_frame_dumper, NULL, 0, NULL));
+        if (g_shots_dir) CloseHandle(CreateThread(NULL, 0, shot_dumper, NULL, 0, NULL));
         return oracle_run(exe_full, RA2_IMAGE_BASE, shims, nshims, hooks, 1);
     }
 
@@ -1429,7 +1741,7 @@ int main(int argc, char** argv) {
     if (!span) { fprintf(stderr, "cannot map %s at 0x%08X\n", exe_full, RA2_IMAGE_BASE); return 1; }
     printf("  mapped %s: 0x%08X-0x%08X\n", exe, RA2_IMAGE_BASE, RA2_IMAGE_BASE + span);
     if (native32_bind(RA2_IMAGE_BASE, shims, nshims)) return 1;
-    if (!g_classic) redirect_dsound();
+    if (!g_classic || g_audio_wasapi || g_audio_trace) redirect_dsound();
     printf("  guest exe %s\n", g_guest_exe);
 
     if (!run) {
@@ -1447,8 +1759,10 @@ int main(int argc, char** argv) {
      * screen and a real mouse. */
     if (input_scripted() && g_classic) { fprintf(stderr, "a scripted run cannot use --classic\n"); return 1; }
     input_start();
+    if (g_headless) battleinfo_start_headless();
     if (!g_classic && !g_headless) present_start(g_scale_mode, g_fullscreen);
     if (g_hd_frames_dir) CloseHandle(CreateThread(NULL, 0, hd_frame_dumper, NULL, 0, NULL));
+    if (g_shots_dir) CloseHandle(CreateThread(NULL, 0, shot_dumper, NULL, 0, NULL));
     if (g_headless && ra2_vox_hd_on) CloseHandle(CreateThread(NULL, 0, hd_probe, NULL, 0, NULL));
     printf("  entering 0x%08X\n\n", ra2_entry_va);
     fflush(stdout);

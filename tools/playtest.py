@@ -31,6 +31,7 @@ fails on the lift and passes there, the lift is wrong; where both fail, the
 host is.
 """
 import argparse
+import collections
 import contextlib
 import fnmatch
 import json
@@ -39,6 +40,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import struct
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -174,6 +176,13 @@ class Script:
         self.t += 1
         return self
 
+    def rclick(self, x, y, after=0, mods=''):
+        """A right click at game pixel x, y, mods as click's."""
+        self.t += after
+        self.args += ['--rclick', '%s%d,%d@%g' % (mods + '+' if mods else '', x, y, self.t)]
+        self.t += 1
+        return self
+
     def drag(self, x1, y1, x2, y2, after=0):
         """A band selection from x1, y1 to x2, y2 (game pixels)."""
         self.t += after
@@ -189,10 +198,37 @@ class Script:
         self.t += 3
         return self
 
+    def hdscale(self, n):
+        """F10's HD vehicles scale, 2 or 3 (input.c --hd-scale N@s)."""
+        self.args += ['--hd-scale', '%d@%g' % (n, self.t)]
+        self.t += 1
+        return self
+
+    def resolution(self, w, h):
+        """F10's game resolution, for the next battle (input.c --resolution)."""
+        self.args += ['--resolution', '%dx%d@%g' % (w, h, self.t)]
+        self.t += 1
+        return self
+
+    def args_add(self, *args):
+        self.args += list(args)
+        return self
+
     def key(self, vk, after=0):
         self.t += after
         self.args += ['--key', '%s@%g' % (vk, self.t)]
         self.t += 1
+        return self
+
+    def _args(self, *a):
+        self.args += list(a)
+        return self
+
+    def selftest_input(self, after=0):
+        """The presenter's input path, fed without a window (--selftest-input)."""
+        self.t += after
+        self.args += ['--selftest-input', '%g' % self.t]
+        self.t += 15
         return self
 
 
@@ -207,8 +243,18 @@ def S():
 #   expect 'alive':   no human player was defeated
 #   expect 'exit':    the exit code
 #   expect 'ini':     RA2MD.INI values for the case's game folder, {section: {key: value}}
+#   expect 'saved':   RA2MD.INI values the run must leave there, {section: {key: value}}
 #   expect 'size':    the picture in game is this (w, h)
 #   expect 'hd':      HD voxels on, and no 2x picture showed the units at 1x
+#   expect 'timer_once': the superweapon timer, at the tactical view's bottom
+#                     right, is drawn once in every full-size --shots picture
+#   expect 'env':     environment variables for the host, {name: value}
+#   expect 'ra2ini':  the presenter's ra2.ini after the run, {section: {key: value}}; the case
+#                     gets its own, empty at start (RA2_PRESENT_INI), not the player's
+#   expect 'log':     {text: n}, lines the game or host prints at least n times
+#   expect 'nolog':   [text], lines it must never print
+#   expect 'audio':   the recording has sound, and not silence (ffmpeg's
+#                     volumedetect: max_volume at least -60 dB)
 CASES = {}
 
 
@@ -320,6 +366,24 @@ hd_scroll = scroll(SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'Sta
                    .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10), 15)
 hd_scroll.args += ['--hd-voxels']
 case('hd-scroll', hd_scroll, 150, ingame=True, hd=True)
+# The same at 3x (issue #34), at 1280x720 where 3x fits the 4096-wide frame.
+hd_scroll_3x = scroll(SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+                      .waitlog(INGAME).move(560, 360, after=2).key('0x48', after=10), 15)
+hd_scroll_3x.args += ['--hd-voxels', '--hd-scale', '3']
+case('hd-scroll-3x', hd_scroll_3x, 150, ingame=True, hd=True,
+     ini={'Video': {'ScreenWidth': 1280, 'ScreenHeight': 720}})
+# The HD scale switched in a battle, 2x -> 3x -> 2x, from the script's thread
+# as F10 does from the presenter's (issue #34: the switch freed the 2x images
+# under a render), while the view scrolls. The overlay's own check
+# (RA2_HDVOX_CHECK) counts opaque pixels left outside the current records: a
+# unit copy from before the switch (issue #39).
+s = SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame').waitlog(INGAME)
+s = scroll(s.move(560, 360, after=2).key('0x48', after=10).hdscale(3), 4)
+s = scroll(s.hdscale(2), 4)
+s.args += ['--hd-voxels']
+case('hd-rescale', s, 150, ingame=True, hdcheck=True, env={'RA2_HDVOX_CHECK': '1'},
+     log={'[hdvox] scale 3x': 1, '[hdvox] scale 2x': 1},
+     ini={'Video': {'ScreenWidth': 1280, 'ScreenHeight': 720}})
 # Building and training: deploy the MCV; build a power plant from the
 # sidebar's first icon and place it beside the construction yard; then a
 # barracks (the second row's first icon, once power is up) the same way; then
@@ -354,6 +418,42 @@ case('skirmish-build', place(place(
     # (a CnCNet install had 3440x1440, and every click missed the sidebar).
     ini={'Video': {'ScreenWidth': 640, 'ScreenHeight': 480}})
 
+# Sidebar grid hotkeys (docs/modern-controls.md): the same start, then Alt+Q
+# with the cursor on the battlefield. The first press builds the first
+# cameo's item (a power plant), the second, once it is ready, picks it up as a
+# click on the cameo would, and the clicks around the yard place it.
+gridkeys = place(
+    SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+    .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
+    .click(236, 213, after=2).key('0x44', after=1).waitlog('Adding event DEPLOY')
+    .move(236, 240, after=8).key('a+0x51', after=1)                     # Alt+Q: build
+    .key('a+0x51', after=28))                                           # ready: Alt+Q picks it up
+gridkeys.args += ['--gridkeys', 'alt']     # headless has no presenter, so no Modern controls setting
+case('skirmish-gridkeys', gridkeys, 150, ingame=True,
+     log={'[gridkeys] Alt+Q -> tab 0 slot 0, left click': 2, 'Adding event PRODUCE': 1, 'Adding event PLACE': 1},
+     ini={'Video': {'ScreenWidth': 640, 'ScreenHeight': 480}})
+
+# Battle info (docs/battle-info.md) on the same build order: every health bar
+# shown (healthbars=always), the build percentage on the cameo being built and
+# the build time in a hovered cameo's tooltip, and the overlay's numbers
+# logged every 10 s in game (the presenter draws them; headless, the host only
+# counts). Each feature's first use is a log line; orders counted are the
+# events the player sent.
+battle_info = place(
+    SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+    .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
+    .click(236, 213, after=2).key('0x44', after=1).waitlog('Adding event DEPLOY')
+    .move(523, 251, after=8).click(523, 251, after=1)                   # power plant
+    .move(523, 300, after=3).move(523, 251, after=25).click(523, 251, after=1))   # hover, then pick it up
+battle_info.args += ['--healthbars', 'always', '--buildinfo', '--overlay']
+case('skirmish-battleinfo', battle_info, 150, ingame=True, alive=True,
+     log={'Adding event PRODUCE': 1, 'Adding event PLACE': 1,
+          '[battleinfo] first health bar shown by healthbars=always': 1,
+          '[battleinfo] first build percentage': 1, '[battleinfo] tooltip build time': 1,
+          '[battleinfo] first order counted': 1,
+          '[battleinfo] overlay ': 3},
+     ini={'Video': {'ScreenWidth': 640, 'ScreenHeight': 480}})
+
 case('skirmish-loop', SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
      .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
      .press(0x108, 'Continue', MAIN), 720, ingame=True)
@@ -364,6 +464,107 @@ for side, emblem in [('allied', 1770), ('soviet', 1772)]:
     case('campaign-' + side, SP().press(SINGLE, 'NewCampaign', CAMPAIGN)
          .press(CAMPAIGN, emblem).waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10),
          300, ingame=True, alive=True)
+
+
+# Attack-move in Modern controls (docs/modern-controls.md). Deploy the MCV (an
+# MCV in the selection cannot attack-move, and the game refuses the lot) and
+# band-select the starting units. The map's two starts are in its top-right
+# and bottom-left corners, and the game picks which is ours, so the units go
+# twice: by the screen edge to the top-right corner, A and a click on open
+# ground there, then the same to the bottom-left. One of the two walks crosses
+# the computer player's base. The same script without A is the control.
+# [hit] is the host's log of the damage the player's side deals, with the
+# attacker's mission: an attack-move stays mission 2 (Move) between fights, so
+# a hit with mission 2 is one on the way; a plain move never fires on the way.
+# The top-right click is open ground whichever base is there: (380, 330) hit
+# our own infantry when the top-right base was ours, and selected one GI.
+AM_LEGS = [((639, 0), (200, 110)), ((0, 479), (120, 380))]   # (screen edge, click)
+
+
+def attackmove(key):
+    s = (SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+         .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
+         .click(236, 213, after=2).key('0x44', after=1)
+         .drag(8, 8, 464, 440, after=15))
+    for k, (edge, dest) in enumerate(AM_LEGS):
+        s = s.move(*edge, after=150 if k else 1).move(*dest, after=40)
+        if key:
+            s = s.key('0x41', after=1)
+        s = s.click(*dest, after=1)
+    s.args += ['--controls', 'modern']
+    return s
+
+
+VGA = {'Video': {'ScreenWidth': 640, 'ScreenHeight': 480}}
+if TARGET == 'game':
+    # Red Alert 2's skirmish map has eight starts and puts the computer player
+    # at a random one: no enemy on a fixed path, so only the order is checked.
+    case('skirmish-attackmove', attackmove(True), 720, ingame=True,
+         log={'[modern] attack-move order': 1}, ini=VGA)
+else:
+    case('skirmish-attackmove', attackmove(True), 720, ingame=True,
+         log={'[modern] attack-move order': 1, 'attacker mission 2 (': 1}, ini=VGA)
+    case('skirmish-move', attackmove(False), 720, ingame=True,
+         nolog=['[modern] attack-move order', 'attacker mission 2 ('], ini=VGA)
+
+
+# Shift-queued moves in Modern controls (docs/modern-controls.md): the
+# starting units, band-selected as for attack-move, get three points by
+# Shift+right-click a second apart, in three corners of the battlefield, so
+# the first leg is still under way when the others are added. The first is
+# the game's own move; the second and third wait in orders.c and go out, in
+# order, as each unit stops.
+def shiftqueue():
+    s = (SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+         .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
+         .click(236, 213, after=2).key('0x44', after=1)
+         .drag(8, 8, 464, 440, after=15))
+    for x, y in [(30, 450), (440, 450), (440, 30)]:
+        s = s.rclick(x, y, mods='s')
+    s.args += ['--controls', 'modern']
+    return s
+
+
+case('skirmish-shiftqueue', shiftqueue(), 300, ingame=True, ini=VGA,
+     log={'[orders] route start at': 1, '[orders] route point 2 at': 1, '[orders] route point 3 at': 1,
+          ': point 2 at': 1, ': point 3 at': 1, 'route done at point 3': 1})
+# The idle keys (Modern controls): a fresh skirmish's starting units stand
+# idle, so the idle-unit key (Comma) selects one and a second press the next;
+# there is no harvester yet, and the idle-harvester key (Period) says so.
+# Then the speed keys (Minus, Plus) and Pause twice: a resume is logged only
+# when no game frame ran while paused (orders.c), so it proves the pause.
+case('skirmish-idlekeys', SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+     .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10)
+     .key('0xBC', after=5).key('0xBC', after=2).key('0xBE', after=2)
+     .key('0xBD', after=1).key('0xBB', after=1).key('0x13', after=1).key('0x13', after=4)
+     ._args('--controls', 'modern'),
+     160, ingame=True, ini=VGA,
+     log={'[orders] idle unit ': 2, ' selected': 2, '[orders] no idle harvester': 1,
+          '[orders] game speed ': 2, '[orders] paused at frame': 1, '[orders] resumed at frame': 1})
+
+
+# The presenter's input (docs/presenter.md), headless: --selftest-input feeds
+# its window procedure in a battle. The cursor lock clips and lets go (focus,
+# minimise, the settings menu) and clips again; a middle-drag reaches the game
+# as the right-drag scroll and the battlefield hook pans at once; a middle
+# click sends nothing; mouse 4 sends the attack-move key and mouse 5 H, bound
+# with --bind (ra2.ini is the player's). An unknown [keys] name is logged.
+# Then the F10 keybinding page: it lists the [keys] table, mouse 4 is rebound
+# to G there, the case's own ra2.ini gets [keys] mouse4=G, and mouse 4 sends G.
+case('input-selftest', SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+     .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10).selftest_input(after=2)
+     ._args('--controls', 'modern', '--bind', 'mouse4=A', '--bind', 'mouse5=H', '--bind', 'bogus=Q'),
+     240, ingame=True, ini=VGA,
+     log={'[input] cursor clip 160,0,1440,960': 4, '[input] cursor released (focus lost)': 2,
+          '[input] cursor released (minimised)': 1, '[input] cursor released (settings)': 1,
+          "[input] middle-drag: the game's right-drag from 320,240": 1, '[modern] middle-drag pan': 1,
+          '[input] middle click: nothing sent': 1, '[input] mouse4 -> key 0x41': 1,
+          '[modern] attack-move key 0x41': 1, '[input] mouse5 -> key 0x48': 1,
+          '[input] key down 0x48 posted to the game': 1, '[keys] unknown key bogus': 1,
+          '[keys] page: mouse4 = A (Mouse button 4 sends)': 1, '[keys] page: settings = F10': 1,
+          '[keys] mouse4=G saved to': 1, '[input] mouse4 -> key 0x47': 1,
+          '[input] key down 0x47 posted to the game': 1, '[selftest] done': 1},
+     ra2ini={'keys': {'mouse4': 'G'}})
 
 
 def set_ini(text, section, key, value):
@@ -399,9 +600,57 @@ for w, h in RES:
     case('res-%dx%d' % (w, h), SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
          .waitlog(INGAME).move(w // 2 - 80, h // 2, after=2).key('0x48', after=10),
          180, ingame=True, size=(w, h), ini=video)
+# A resolution picked from F10 in the menus (--resolution, the menu's own
+# code), then the game quit from its menu: its own save of the options on exit
+# must keep the new size, which the next start opens at (issue #39).
+case('res-f10-saved', EXIT(S().resolution(1720, 720)), 60, exit=0,
+     ini={'Video': {'ScreenWidth': 1024, 'ScreenHeight': 768}},
+     saved={'Video': {'ScreenWidth': '1720', 'ScreenHeight': '720'}})
+# Yuri's Revenge also opens the next battle at it, without a restart. Red
+# Alert 2 sets its mode once, at start (present.c, RES_WHEN): F10 offers to
+# restart it, and res-f10-saved is what that restart reads.
+if TARGET != 'game':
+    case('res-next-battle', SP().resolution(1720, 720).press(SINGLE, 'Skirmish', SKIRMISH)
+         .press(SKIRMISH, 'StartGame').waitlog(INGAME).move(780, 360, after=2).key('0x48', after=10),
+         180, ingame=True, size=(1720, 720), ini={'Video': {'ScreenWidth': 1024, 'ScreenHeight': 768}})
+# UI scale 2x (docs/presenter.md): at 3440x1440 less the 168 lines the 2x
+# sidebar adds, the sidebar laid out in the top half of its strip, and the
+# view 32 lines shorter for the bar under it drawn 2x (1440 - 64). Headless
+# there is no presenter to compose it; the case shows the layout and a
+# battle that runs with it, and --selftest-input composes a made-up frame:
+# the radar (the strip's top 158 lines) drawn 2x at the top right, and a
+# click on its centre reaching the game's radar.
+case('ui-scale-2x', SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+     .waitlog(INGAME).move(1556, 720, after=2).key('0x48', after=10).selftest_input(after=2),
+     180, ingame=True, size=(3272, 1440), ini={'Video': {'ScreenWidth': 3272, 'ScreenHeight': 1440}},
+     env={'RA2_UI_SCALE': '2'}, log={'[present] UI scale 2x: sidebar': 1, '[present] UI scale 2x: view': 1,
+                                     'Set_View_Dimensions(0,0,3104,1376)': 1,
+                                     '[selftest] UI scale 2x: radar 168x158 drawn as 336x316 at 3104,0; '
+                                     'its centre maps to game 3188,79': 1})
+# The WASAPI sound (--audio wasapi, audio_wasapi.c): the mixer is tapped into
+# the recording (before --mute's gain), so the sound the game made is in
+# run.mp4. A skirmish (the music, EVA, the units) and a Bink movie (its sound
+# goes through the game's DirectSound object).
+case('audio-wasapi-skirmish', SP().press(SINGLE, 'Skirmish', SKIRMISH).press(SKIRMISH, 'StartGame')
+     .waitlog(INGAME).move(236, 240, after=2).key('0x48', after=10).args_add('--audio', 'wasapi'),
+     180, ingame=True, audio=True)
+case('audio-wasapi-movie', S().press(MAIN, 'MoviesAndCredits', MOVIES).press(MOVIES, 'SneakPeeks')
+     .args_add('--audio', 'wasapi'), 90, audio=True)
 case('res-campaign-1920x1080', SP().press(SINGLE, 'NewCampaign', CAMPAIGN).press(CAMPAIGN, 1770)
      .waitlog(INGAME).move(880, 540, after=2).key('0x48', after=10), 300, ingame=True, alive=True,
      size=(1920, 1080), ini={'Video': {'ScreenWidth': 1920, 'ScreenHeight': 1080}})
+# A view larger than the map (issue #27): the Allied first mission at 3440x1440,
+# scrolled with the arrow keys. The view jumped and left the base drawn twice.
+s = (SP().press(SINGLE, 'NewCampaign', CAMPAIGN).press(CAMPAIGN, 1770)
+     .waitlog(INGAME).move(1640, 720, after=2).key('0x48', after=10))
+for vk in ['0x25'] * 3 + ['0x27'] * 6 + ['0x26'] * 3 + ['0x28'] * 6:
+    s = s.key(vk, after=1)
+# Yuri's Revenge's mission has a Psychic Dominator timer, drawn again on every
+# scroll, a column of copies down the left of the sidebar: timer_once. Red
+# Alert 2's has no timer, and starts in the INI's mode, so its menus are full
+# size too.
+case('res-campaign-3440x1440', s, 300, ingame=True, alive=True, size=(3440, 1440),
+     timer_once=TARGET == 'gamemd', ini={'Video': {'ScreenWidth': 3440, 'ScreenHeight': 1440}})
 
 
 def farm(d, ini=None):
@@ -435,6 +684,37 @@ def farm(d, ini=None):
     return d
 
 
+def timer_copies(bmp):
+    """How many times the superweapon timer is drawn in one --shots picture:
+    the bands of rows, in a strip left of the sidebar, holding the timer's
+    colour; None when the picture is not full size or shows no timer. The
+    timer is right-aligned at the tactical view's bottom right, just above the
+    bottom bar (the first full-width rows from the bottom), so its colour is
+    the commonest there. Copies left behind by a scroll are the same pixels."""
+    w, h = struct.unpack('<ii', open(bmp, 'rb').read(26)[18:26])
+    h = abs(h)
+    if (w, h) == (800, 600):
+        return None
+    x, cw = w - 560, 360                             # ends left of the sidebar (168 wide) and its frame
+    raw = subprocess.run(['ffmpeg', '-v', 'error', '-i', bmp, '-vf', 'crop=%d:%d:%d:0' % (cw, h, x),
+                          '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], capture_output=True).stdout
+    if len(raw) != cw * h * 3:
+        return None
+    rows = [[raw[i:i + 3] for i in range(y * cw * 3, (y + 1) * cw * 3, 3)] for y in range(h)]
+    black = b'\0\0\0'
+    bar = next((y for y in range(h - 100, h) if sum(p != black for p in rows[y]) > 0.9 * cw), h)
+    near = collections.Counter(p for r in rows[bar - 40:bar] for p in r if p != black)
+    if not near:
+        return None
+    colour = near.most_common(1)[0][0]
+    bands, last = 0, -10
+    for y in range(bar):
+        if sum(p == colour for p in rows[y]) >= 3:
+            bands += y - last > 4                    # a gap of more than 4 rows starts a new band
+            last = y
+    return bands
+
+
 def run(name, args, seconds, expect, every, original=False):
     d = os.path.join(OUT, name + ('.original' if original else ''))
     if os.path.isdir(os.path.join(d, 'game')):
@@ -442,9 +722,19 @@ def run(name, args, seconds, expect, every, original=False):
     os.makedirs(d, exist_ok=True)
     game = farm(os.path.join(d, 'game'), expect.get('ini'))
     mp4, log = os.path.join(d, 'run.mp4'), os.path.join(d, 'run.log')
+    env = {**os.environ, **expect.get('env', {})}
+    ini = os.path.join(d, 'ra2.ini')
+    if 'ra2ini' in expect:
+        open(ini, 'w').close()
+        env['RA2_PRESENT_INI'] = host_path(ini)
     cmd = WINE + [HOST, '--headless', '--run', '--mute', '--debuglog', '--watchdog', str(seconds),
                   '--record', host_path(mp4), '--exe', host_path(os.path.join(game, GAME_EXE)),
                   '--game', host_path(game)] + args
+    if expect.get('timer_once'):
+        for f in os.listdir(d):
+            if f.startswith('shot_'):
+                os.remove(os.path.join(d, f))
+        cmd += ['--shots', host_path(d)]
     cmd += os.environ.get('RA2_HOST_ARGS', '').replace('{case}', d).split()  # extra host flags; {case} is the case's folder
     if original:
         cmd.append('--original')
@@ -452,7 +742,7 @@ def run(name, args, seconds, expect, every, original=False):
     with open(log, 'w', errors='replace') as f, (IPX if lan else contextlib.nullcontext()):
         try:
             code = subprocess.run(cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT,
-                                  timeout=seconds + 300).returncode
+                                  env=env, timeout=seconds + 300).returncode
         except subprocess.TimeoutExpired:
             code = 'timeout'
     text = open(log, errors='replace').read()
@@ -503,6 +793,47 @@ def run(name, args, seconds, expect, every, original=False):
                 bad.append('%d pictures with the units at 1x' % dips)
             if shown < 0.9 * offered or not offered:
                 bad.append('units at 2x in only %d of %d pixels' % (shown, offered))
+    # timer_once: read the full-size shots (the recording is scaled into
+    # 800x600, too coarse to tell copies apart), keep the last as a PNG, and
+    # delete the rest: 20 MB each.
+    if expect.get('timer_once'):
+        shots = sorted(f for f in os.listdir(d) if f.startswith('shot_') and f.endswith('.bmp'))
+        counts = [(f, timer_copies(os.path.join(d, f))) for f in shots]
+        counts = [(f, n) for f, n in counts if n is not None]
+        if counts:
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', os.path.join(d, counts[-1][0]),
+                            os.path.join(d, 'last-full.png')], cwd=ROOT)
+        for f in shots:
+            os.remove(os.path.join(d, f))
+        worst = max(counts, key=lambda c: c[1]) if counts else None
+        if not worst:
+            bad.append('no full-size shot showed the timer')
+        else:
+            seen.append('timer once in %d shots' % sum(n == 1 for _, n in counts) if worst[1] == 1
+                        else 'timer x%d in %s' % (worst[1], worst[0]))
+            if worst[1] > 1:
+                bad.append('the timer drawn %d times (%s)' % (worst[1], worst[0]))
+    # hdcheck: the overlay (RA2_HDVOX_CHECK) ran and left nothing outside the records
+    if expect.get('hdcheck'):
+        ov = re.findall(r'\[hdvox\] overlay \d+x\d+ at \dx: (\d+) calls, (\d+) pixels outside', text)
+        if not ov or int(ov[-1][0]) < 100:
+            bad.append('the overlay check never ran')
+        else:
+            seen.append('overlay: %s calls, %s pixels outside the records' % ov[-1])
+            if int(ov[-1][1]):
+                bad.append('%s overlay pixels outside the records (unit copies)' % ov[-1][1])
+    if expect.get('audio'):
+        vd = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-i', mp4, '-vn', '-af', 'volumedetect', '-f', 'null',
+                             '-'], cwd=ROOT, capture_output=True, text=True, errors='replace').stderr \
+            if os.path.exists(mp4) else ''
+        peak = re.search(r'max_volume: (-?[\d.]+|-inf) dB', vd)
+        mean = re.search(r'mean_volume: (-?[\d.]+|-inf) dB', vd)
+        if not peak:
+            bad.append('no sound in the recording')
+        else:
+            seen.append('sound peak %s dB, mean %s dB' % (peak.group(1), mean.group(1) if mean else '?'))
+            if peak.group(1) == '-inf' or float(peak.group(1)) < -60:
+                bad.append('the recording is silent (peak %s dB)' % peak.group(1))
     # log: {text: at least n}, lines the game's own debug log must print
     # ("Adding event PRODUCE" for each order to build or train).
     for text, n in expect.get('log', {}).items():
@@ -511,6 +842,38 @@ def run(name, args, seconds, expect, every, original=False):
             bad.append('"%s" %d times, wanted %d' % (text, got, n))
         elif n:
             seen.append('%s x%d' % (text.split()[-1].lower(), got))
+    for sec, kv in expect.get('saved', {}).items():
+        p = os.path.join(game, GAME_INI)
+        body = open(p, errors='replace').read() if os.path.exists(p) else ''
+        m = re.search(r'(?ims)^\[%s\]\s*$(.*?)(?=^\[|\Z)' % re.escape(sec), body)
+        for k, v in kv.items():
+            got = re.search(r'(?im)^%s\s*=\s*(.*?)\s*$' % re.escape(k), m.group(1)) if m else None
+            got = got and got.group(1)
+            if got != v:
+                bad.append('%s [%s] %s=%s, wanted %s' % (GAME_INI, sec, k, got, v))
+            else:
+                seen.append('saved %s=%s' % (k, v))
+    # ra2ini: what the presenter saved (the F10 keybinding page)
+    if 'ra2ini' in expect:
+        saved, sec = {}, None
+        for l in open(ini, errors='replace').read().splitlines():
+            l = l.strip()
+            if l.startswith('['):
+                sec = l.strip('[]').lower()
+            elif '=' in l and sec:
+                saved.setdefault(sec, {})[l.split('=')[0].strip().lower()] = l.split('=', 1)[1].strip()
+        for sec, kv in expect['ra2ini'].items():
+            for k, v in kv.items():
+                got = saved.get(sec.lower(), {}).get(k.lower())
+                if got != str(v):
+                    bad.append('ra2.ini [%s] %s=%s, wanted %s' % (sec, k, got, v))
+                else:
+                    seen.append('ra2.ini %s=%s' % (k, got))
+    # nolog: lines the run must not print (a control case: [hit] in a plain move)
+    for text in expect.get('nolog', []):
+        got = sum(text in l for l in lines)
+        if got:
+            bad.append('"%s" %d times, wanted none' % (text, got))
     if 'exit' in expect and code != expect['exit']:
         bad.append('expected exit %d' % expect['exit'])
     elif 'exit' not in expect and code not in (0, 4):

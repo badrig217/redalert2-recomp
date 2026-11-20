@@ -41,6 +41,52 @@ if(NOT GEN_SOURCES)
   message(FATAL_ERROR "${GEN_DIR} is empty -- run ./setup.sh (Setup.cmd on Windows) first: it lifts each game")
 endif()
 
+# ---- the web: the lifted C on runtime/win32hle, compiled to WebAssembly
+# with Emscripten (build-web.sh: emcmake cmake ...). One linear memory, so
+# the guest's 32-bit addresses are the program's own (RECOMP_FLAT_MEMORY):
+# the image goes at 0x00400000 and the toolchain's static data, stack and
+# heap start above it (GLOBAL_BASE, 16 MB). The game runs on a pthread
+# (PROXY_TO_PTHREAD) so it may block as a Win32 program does; its files come
+# from WASMFS: the player's own game folder, imported into the browser's
+# storage, and saves beside it (src/web/web.c). The movies play through the
+# page (web/movies.js).
+if(EMSCRIPTEN)
+  set(HLE ${PCRECOMP}/runtime/win32hle)
+  file(GLOB HLE_SOURCES CONFIGURE_DEPENDS "${HLE}/*.c")
+  list(FILTER HLE_SOURCES EXCLUDE REGEX "_selftest\.c$")
+  add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c
+                     src/web/web.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c ${HLE_SOURCES} ${GEN_SOURCES})
+  # yr.js/yr.wasm (Yuri's Revenge) or ra2.js/ra2.wasm (Red Alert 2): both
+  # can sit on one page, which offers the games it finds (web/index.html)
+  if(RA2_TARGET STREQUAL "game")
+    set_target_properties(ra2 PROPERTIES OUTPUT_NAME "ra2" SUFFIX ".js")
+  else()
+    set_target_properties(ra2 PROPERTIES OUTPUT_NAME "yr" SUFFIX ".js")
+  endif()
+  target_include_directories(ra2 PRIVATE src/linux src/runtime src/web ${GEN_DIR} ${HLE} ${PCRECOMP}/runtime/recomp32)
+  set(WEB_GLOBAL_BASE 0x1000000)
+  target_compile_definitions(ra2 PRIVATE RECOMP_RETADDR=0u RECOMP_LOCAL_REGS RECOMP_FLAT_MEMORY HLE_FIXED_END=${WEB_GLOBAL_BASE}u)
+  set(GEN_OPT "-O2" CACHE STRING "optimisation for the generated C")
+  set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-w;${GEN_OPT};-fno-strict-aliasing;-fwrapv")
+  target_compile_options(ra2 PRIVATE -fno-strict-aliasing -fwrapv -pthread --use-port=sdl2 --use-port=sdl2_ttf)
+  set(WEB_LINK_OPT "-O1" CACHE STRING "optimisation at link (wasm-opt)")
+  set(WEB_ASSERTIONS 0 CACHE STRING "Emscripten runtime assertions (1: readable aborts, slower)")
+  # -g0: the configuration's -g would otherwise keep DWARF for 270 MB of lifted C in the link
+  target_link_options(ra2 PRIVATE ${WEB_LINK_OPT} -g0 --profiling-funcs -pthread --use-port=sdl2 --use-port=sdl2_ttf
+    -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=8
+    -sWASMFS -lfetchfs.js -lopfs.js
+    -sOFFSCREEN_FRAMEBUFFER   # SDL's GL calls from the game's thread are proxied to the browser's main thread, which owns the canvas
+    -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2
+    -sGLOBAL_BASE=16MB
+    -sINITIAL_MEMORY=1024MB -sMAXIMUM_MEMORY=2048MB -sALLOW_MEMORY_GROWTH
+    -sSTACK_SIZE=16MB -sDEFAULT_PTHREAD_STACK_SIZE=4MB
+    -sEXIT_RUNTIME -sENVIRONMENT=web,worker
+    -sASSERTIONS=${WEB_ASSERTIONS} -sALLOW_UNIMPLEMENTED_SYSCALLS
+    -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8,UTF8ToString
+    -sMODULARIZE=0 -sEXPORT_NAME=RA2)
+  return()
+endif()
+
 # ---- native Linux and macOS: the lifted C on runtime/win32hle. 32-bit
 # (cmake/linux-i386.cmake) a guest address is a host address; 64-bit
 # (build-macos.sh, or Linux x86-64/arm64) it is an offset into the guest's
@@ -60,9 +106,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
   set(HLE ${PCRECOMP}/runtime/win32hle)
   file(GLOB HLE_SOURCES CONFIGURE_DEPENDS "${HLE}/*.c")
   list(FILTER HLE_SOURCES EXCLUDE REGEX "_selftest\.c$|/[.]_[^/]*$")
-  add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c src/runtime/hdvox.c src/runtime/queuefive.c ${HLE_SOURCES} ${GEN_SOURCES})
+  add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c ${HLE_SOURCES} ${GEN_SOURCES})
   target_include_directories(ra2 PRIVATE src/linux src/runtime ${GEN_DIR} ${HLE} ${PCRECOMP}/runtime/recomp32)
   target_compile_definitions(ra2 PRIVATE RECOMP_RETADDR=0u RECOMP_LOCAL_REGS)
+  # Faster lifted code, on win32hle only (native32 has neither, and MSVC
+  # lacks the statement expressions the site cache is written with): the x87
+  # stack's push and pop move a pointer over a ring and a function's own
+  # pushes stay in locals (RECOMP_X87_RING, RECOMP_X87_LOCAL; a lift from
+  # pcrecomp after #175 writes the slots as _ST(i)); and an indirect call's
+  # target is cached, per call site and in one table (RECOMP_ICALL_SITE_CACHE,
+  # RECOMP_RESOLVE_CACHE), which win32hle's machine lock makes safe: one
+  # thread at a time runs lifted code. A headless skirmish at the fastest
+  # speed on an M1 Pro: 389 frames a second before, 642 after (the caches
+  # most of it, the x87 ring about 3%). A toolkit without them ignores them.
+  target_compile_definitions(ra2 PRIVATE RECOMP_X87_RING RECOMP_X87_LOCAL
+                                         RECOMP_RESOLVE_CACHE=16384 RECOMP_ICALL_SITE_CACHE)
   if(WITH_FFMPEG)
     target_compile_definitions(ra2 PRIVATE HLE_WITH_FFMPEG)
   endif()
@@ -100,12 +158,16 @@ endif()
 
 add_executable(ra2
   src/runtime/host.c
+  src/runtime/audio_wasapi.c
   src/runtime/input.c
   src/runtime/mods.c
   src/runtime/oracle.c
   src/runtime/present.c
   src/runtime/hdvox.c
   src/runtime/queuefive.c
+  src/runtime/orders.c
+  src/runtime/gridkeys.c
+  src/runtime/battleinfo.c
   ${PCRECOMP}/runtime/native32/native32.c
   ${PCRECOMP}/runtime/recomp32/image_loader.c
   ${PCRECOMP}/runtime/recomp32/recomp_trace.c
@@ -134,7 +196,7 @@ if(MSVC_VERSION GREATER_EQUAL 1950)
   string(APPEND GEN_OPT ";/d2SSAOptimizer-")
 endif()
 set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "/w;${GEN_OPT}")
-set_source_files_properties(src/runtime/host.c src/runtime/input.c src/runtime/mods.c src/runtime/oracle.c src/runtime/present.c src/runtime/hdvox.c src/runtime/queuefive.c PROPERTIES COMPILE_OPTIONS "/W3")
+set_source_files_properties(src/runtime/host.c src/runtime/audio_wasapi.c src/runtime/input.c src/runtime/mods.c src/runtime/oracle.c src/runtime/present.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/orders.c src/runtime/battleinfo.c PROPERTIES COMPILE_OPTIONS "/W3")
 target_link_libraries(ra2 PRIVATE user32 gdi32 kernel32 ole32 uuid ddraw dxguid winmm d3d11 dxgi shell32)
 
 option(RA2_TRACE "record a ring buffer of lifted function entries" OFF)
