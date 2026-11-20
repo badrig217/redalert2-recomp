@@ -55,7 +55,7 @@ if(EMSCRIPTEN)
   file(GLOB HLE_SOURCES CONFIGURE_DEPENDS "${HLE}/*.c")
   list(FILTER HLE_SOURCES EXCLUDE REGEX "_selftest\.c$")
   add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c
-                     src/web/web.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c ${HLE_SOURCES} ${GEN_SOURCES})
+                     src/web/web.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c src/runtime/bsurface.c ${HLE_SOURCES} ${GEN_SOURCES})
   # yr.js/yr.wasm (Yuri's Revenge) or ra2.js/ra2.wasm (Red Alert 2): both
   # can sit on one page, which offers the games it finds (web/index.html)
   if(RA2_TARGET STREQUAL "game")
@@ -106,7 +106,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
   set(HLE ${PCRECOMP}/runtime/win32hle)
   file(GLOB HLE_SOURCES CONFIGURE_DEPENDS "${HLE}/*.c")
   list(FILTER HLE_SOURCES EXCLUDE REGEX "_selftest\.c$|/[.]_[^/]*$")
-  add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c ${HLE_SOURCES} ${GEN_SOURCES})
+  add_executable(ra2 src/linux/main.c src/linux/blowfish.c src/linux/script.c src/linux/mods.c src/linux/menu.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/gridkeys.c src/runtime/bsurface.c ${HLE_SOURCES} ${GEN_SOURCES})
   target_include_directories(ra2 PRIVATE src/linux src/runtime ${GEN_DIR} ${HLE} ${PCRECOMP}/runtime/recomp32)
   target_compile_definitions(ra2 PRIVATE RECOMP_RETADDR=0u RECOMP_LOCAL_REGS)
   # Faster lifted code, on win32hle only (native32 has neither, and MSVC
@@ -167,6 +167,7 @@ add_executable(ra2
   src/runtime/queuefive.c
   src/runtime/orders.c
   src/runtime/gridkeys.c
+  src/runtime/bsurface.c
   src/runtime/battleinfo.c
   ${PCRECOMP}/runtime/native32/native32.c
   ${PCRECOMP}/runtime/recomp32/image_loader.c
@@ -196,7 +197,7 @@ if(MSVC_VERSION GREATER_EQUAL 1950)
   string(APPEND GEN_OPT ";/d2SSAOptimizer-")
 endif()
 set_source_files_properties(${GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "/w;${GEN_OPT}")
-set_source_files_properties(src/runtime/host.c src/runtime/audio_wasapi.c src/runtime/input.c src/runtime/mods.c src/runtime/oracle.c src/runtime/present.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/orders.c src/runtime/battleinfo.c PROPERTIES COMPILE_OPTIONS "/W3")
+set_source_files_properties(src/runtime/host.c src/runtime/audio_wasapi.c src/runtime/input.c src/runtime/mods.c src/runtime/oracle.c src/runtime/present.c src/runtime/hdvox.c src/runtime/queuefive.c src/runtime/orders.c src/runtime/battleinfo.c src/runtime/bsurface.c PROPERTIES COMPILE_OPTIONS "/W3")
 target_link_libraries(ra2 PRIVATE user32 gdi32 kernel32 ole32 uuid ddraw dxguid winmm d3d11 dxgi shell32)
 
 option(RA2_TRACE "record a ring buffer of lifted function entries" OFF)
